@@ -59,7 +59,7 @@ except NameError:
     # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
     ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
-MANAGER_VERSION = 28
+MANAGER_VERSION = 29
 
 
 def _freecad_major_version():
@@ -121,6 +121,43 @@ globals().update({
     "MANAGER_VERSION": MANAGER_VERSION, "QT_HORIZONTAL": QT_HORIZONTAL,
     "_dialog_button": _dialog_button,
 })
+
+
+def _world_placement(obj):
+    """Return an object's placement in document coordinates.
+
+    FreeCAD 26.3 introduced ``getPlacementOf`` as the link-aware replacement
+    for the deprecated ``getGlobalPlacement`` Python method.  Keep the old
+    call as a compatibility fallback for earlier 26.x builds.
+    """
+    try:
+        parents = getattr(obj, "Parents", None) or []
+        if parents:
+            root, path = parents[0]
+            subname = "%s%s" % (path or "", obj.Name)
+            return root.getPlacementOf(subname, obj)
+        return obj.Placement
+    except Exception:
+        try:
+            return obj.getGlobalPlacement()
+        except Exception:
+            return getattr(obj, "Placement", None)
+
+
+globals()["_world_placement"] = _world_placement
+
+
+def _same_ref(left, right):
+    """Compare Pivy wrappers without relying only on Python object identity."""
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+globals()["_same_ref"] = _same_ref
 
 
 def _publish(obj):
@@ -290,11 +327,17 @@ class ShaderGrid:
         sep.addChild(coords)
         sep.addChild(face)
 
-        self.root = coin.SoSwitch()
+        # Keep the switch below an uncullable separator.  A switch does not
+        # expose renderCulling itself, and some Coin versions can otherwise
+        # cull the whole overlay from the placeholder's tiny world-space box.
+        self.root = coin.SoSeparator()
+        self.root.renderCulling = coin.SoSeparator.OFF
         for node in _base_nodes():
             self.root.addChild(node)
-        self.root.addChild(sep)
-        self.root.whichChild = -3          # SO_SWITCH_ALL
+        self.content = coin.SoSwitch()
+        self.content.addChild(sep)
+        self.content.whichChild = -3       # SO_SWITCH_ALL
+        self.root.addChild(self.content)
         self.sg.addChild(self.root)
         self.apply_settings()
 
@@ -307,8 +350,8 @@ class ShaderGrid:
         self.minor_alpha.value = strength * 0.35
         self.major_alpha.value = strength
 
-    SHADOW_MAX = 64          # must match SHADOW_MAX in grid.frag.glsl
-    SHADOW_STRIDE = 5        # must match SHADOW_STRIDE in grid.frag.glsl
+    SHADOW_MAX = 8           # must match SHADOW_MAX in grid.frag.glsl
+    SHADOW_STRIDE = 4        # packed centre + half extents
 
     @staticmethod
     def _shown(obj, depth=0):
@@ -362,10 +405,7 @@ class ShaderGrid:
                     continue
                 gp = None               # world placement for objects in a Part
                 if parent is not None:
-                    try:
-                        gp = obj.getGlobalPlacement()
-                    except Exception:
-                        gp = None
+                    gp = _world_placement(obj)
                 key = None
                 try:
                     key = (shape.hashCode(),
@@ -431,8 +471,10 @@ class ShaderGrid:
         for cx, cy, hx, hy, height, _name in items:
             hx = max(hx, 1e-4)
             hy = max(hy, 1e-4)
-            blur = 0.3 * min(hx, hy) + 0.1 * height   # taller -> softer, wider
-            data.extend((cx, cy, hx, hy, blur))
+            # Keep four values per slot so the fragment uniform remains small
+            # enough for older OpenGL implementations.  The blur scales with
+            # footprint; the geometry height is intentionally not uploaded.
+            data.extend((cx, cy, hx, hy))
         data.extend([0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE - len(data)))
         _set_mf_floats(self.shadow_data.value, data)
         self.shadow_count.value = float(len(items))
@@ -446,7 +488,16 @@ class ShaderGrid:
     def set_visible(self, visible):
         self.visible = bool(visible)
         # Coin3D: SO_SWITCH_ALL == -3, SO_SWITCH_NONE == -1.
-        self.root.whichChild = -3 if self.visible else -1
+        self.content.whichChild = -3 if self.visible else -1
+
+    def belongs_to(self, view):
+        """Whether this overlay is still attached to the requested view."""
+        if view is None:
+            return False
+        try:
+            return _same_ref(self.sg, view.getSceneGraph())
+        except Exception:
+            return False
 
     def remove(self):
         try:
@@ -512,8 +563,14 @@ class GridManager:
         doc = getattr(App, "ActiveDocument", None)
         if doc is None:
             return
-        if setting("enabled") and doc.Name not in self.items:
-            view = self._view()
+        view = self._view()
+        grid = self.items.get(doc.Name)
+        if grid is not None and not grid.belongs_to(view):
+            # A document can have more than one 3D view, and some workbenches
+            # replace the scene graph while keeping the document open.
+            self.remove_grid(doc.Name)
+            grid = None
+        if setting("enabled") and grid is None:
             if view is None:
                 if _retry < 10:     # view may not exist yet during startup
                     QtCore.QTimer.singleShot(

@@ -6,9 +6,11 @@ uniform float base_spacing;   // world units of the finest "decade" unit
 uniform float minor_alpha;
 uniform float major_alpha;
 // Per-object ground shadows. Slot i occupies SHADOW_STRIDE floats:
-//   centre x, centre y, half-width, half-depth, blur (world units)
-const int SHADOW_MAX    = 64;
-const int SHADOW_STRIDE = 5;
+//   centre x, centre y, half-width, half-depth (world units)
+// The compact layout keeps the shader linkable on OpenGL implementations with
+// smaller fragment-uniform limits; the blur is derived from the footprint.
+const int SHADOW_MAX    = 8;
+const int SHADOW_STRIDE = 4;
 uniform float shadow_data[SHADOW_MAX * SHADOW_STRIDE];
 uniform float shadow_count;    // number of used slots
 uniform float shadow_opacity;  // 0 = off (no cost)
@@ -99,7 +101,7 @@ void main()
             int o = i * SHADOW_STRIDE;
             vec2  c    = vec2(shadow_data[o],     shadow_data[o + 1]);
             vec2  h    = vec2(shadow_data[o + 2], shadow_data[o + 3]);
-            float blur = max(shadow_data[o + 4], 1e-6);
+            float blur = max(0.3 * min(h.x, h.y), 1e-6);
             vec2  q    = p.xy - c;
             // Approximate signed distance to an axis-aligned ellipse.
             float k0   = length(q / h);
