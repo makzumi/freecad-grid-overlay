@@ -2,9 +2,9 @@
 """Grid Overlay add-on for FreeCAD (legacy Mod-folder layout).
 
 The grid is a single full-screen quad drawn by a GLSL shader: the fragment
-shader intersects each pixel's view ray with the z=0 plane and draws
-anti-aliased, level-of-detail-blended lines. There is no per-frame Python work
-(no camera sensor, no polling timer, no geometry rebuilds).
+shader intersects each pixel's view ray with the model ground plane and draws
+anti-aliased, level-of-detail-blended lines. There is no per-frame Python work;
+a low-frequency lifecycle check only repairs attachment after a view rebuild.
 """
 import os
 import math
@@ -59,7 +59,18 @@ except NameError:
     # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
     ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
-MANAGER_VERSION = 29
+MANAGER_VERSION = 37
+
+
+def _doc_name(doc):
+    """Best-effort document name from an observer argument."""
+    name = getattr(doc, "Name", None)
+    if name is None and isinstance(doc, str):
+        name = doc
+    return name
+
+
+globals()["_doc_name"] = _doc_name
 
 
 def _freecad_major_version():
@@ -115,7 +126,8 @@ QT_HORIZONTAL = _qt_enum("Horizontal")
 # that mode, names assigned by exec() are not visible to functions/classes
 # created by the exec unless they are explicitly published to its globals.
 globals().update({
-    "os": os, "math": math, "App": App, "Gui": Gui, "coin": coin,
+    "os": os, "math": math,
+    "App": App, "Gui": Gui, "coin": coin,
     "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
     "Signal": Signal, "ADDON_DIR": ADDON_DIR, "SETTINGS": SETTINGS,
     "MANAGER_VERSION": MANAGER_VERSION, "QT_HORIZONTAL": QT_HORIZONTAL,
@@ -173,10 +185,25 @@ DEFAULTS = {
     "opacity": 0.65,
     "color": "#808080",
     "base_spacing": 1.0,
+    "grid_unit": "mm",
     "shadow_enabled": True,
     "shadow_opacity": 0.30,
 }
 globals()["DEFAULTS"] = DEFAULTS
+
+GRID_UNIT_OPTIONS = (
+    ("mm", "Millimeters", 1.0),
+    ("cm", "Centimeters", 10.0),
+    ("m", "Meters", 1000.0),
+    ("in", "Inches", 25.4),
+    ("ft", "Feet", 304.8),
+)
+GRID_UNIT_FACTORS = dict((key, factor)
+                         for key, _label, factor in GRID_UNIT_OPTIONS)
+globals().update({
+    "GRID_UNIT_OPTIONS": GRID_UNIT_OPTIONS,
+    "GRID_UNIT_FACTORS": GRID_UNIT_FACTORS,
+})
 
 
 @_publish
@@ -186,6 +213,9 @@ def setting(key):
         if isinstance(value, bool):
             return value
         return str(value).lower() in ("true", "1", "yes", "on")
+    if key == "grid_unit":
+        value = str(value).strip().lower()
+        return value if value in GRID_UNIT_FACTORS else DEFAULTS[key]
     if key in ("opacity", "shadow_opacity", "base_spacing"):
         try:
             result = float(value)
@@ -195,6 +225,12 @@ def setting(key):
             return max(0.01, min(100.0, result))
         return max(0.0, min(1.0, result))
     return str(value)
+
+
+@_publish
+def grid_spacing_mm():
+    """Return the selected grid spacing in FreeCAD's internal millimeters."""
+    return setting("base_spacing") * GRID_UNIT_FACTORS[setting("grid_unit")]
 
 
 @_publish
@@ -249,16 +285,28 @@ globals()["_set_mf_floats"] = _set_mf_floats
 
 @_publish
 class ShaderGrid:
-    """Infinite z=0 grid drawn by a shader on a 4-vertex placeholder quad."""
+    """Infinite ground grid drawn by a shader on a 4-vertex placeholder quad."""
+
+    # SoRenderManager::Superimposition flags. Keep the existing depth buffer
+    # so the grid remains behind model geometry, but do not clear it before
+    # rendering the independent grid pass.
+    _SUPERIMPOSE_ZBUFFER = 0x0001
+    _SUPERIMPOSE_AUTOREDRAW = 0x0004
 
     # Placeholder corners. The vertex shader only uses their sign, so they can
     # be tiny: that keeps the scene bounding box (near/far clipping, view fit)
     # unaffected by the grid.
     _EPS = 1e-6
 
-    def __init__(self, view):
+    def __init__(self, view, doc_name=None):
         self.view = view
+        self.doc_name = doc_name
         self.sg = view.getSceneGraph()
+        self.render_manager = None
+        self.render_scene_graph = None
+        self.superimposition = None
+        self.overlay_camera = None
+        self._scene_render_culling = None
         self.visible = True
 
         shader_dir = os.path.join(ADDON_DIR, "Resources")
@@ -271,6 +319,10 @@ class ShaderGrid:
         self.grid_color.name = "grid_color"
         self.base_spacing = coin.SoShaderParameter1f()
         self.base_spacing.name = "base_spacing"
+        self.grid_z = coin.SoShaderParameter1f()
+        self.grid_z.name = "grid_z"
+        self.grid_z.value = 0.0
+        self._grid_z = 0.0
         self.minor_alpha = coin.SoShaderParameter1f()
         self.minor_alpha.name = "minor_alpha"
         self.major_alpha = coin.SoShaderParameter1f()
@@ -285,7 +337,8 @@ class ShaderGrid:
         self.shadow_visible = False
         self._bounds_cache = {}
         self._last_shadow_names = None
-        params = [self.grid_color, self.base_spacing,
+        self.ground_ready = False
+        params = [self.grid_color, self.base_spacing, self.grid_z,
                   self.minor_alpha, self.major_alpha,
                   self.shadow_count, self.shadow_opacity]
         try:
@@ -338,15 +391,71 @@ class ShaderGrid:
         self.content.addChild(sep)
         self.content.whichChild = -3       # SO_SWITCH_ALL
         self.root.addChild(self.content)
-        self.sg.addChild(self.root)
+        if not self._attach_superimposition(view):
+            # Compatibility fallback for older FreeCAD/Coin builds without a
+            # render-manager superimposition API. In the normal scene graph,
+            # disable culling at its root because the placeholder is tiny and
+            # centred at the origin.
+            self._disable_scene_culling()
+            self.sg.addChild(self.root)
         self.apply_settings()
+
+    def _disable_scene_culling(self):
+        try:
+            self._scene_render_culling = self.sg.renderCulling.getValue()
+            self.sg.renderCulling = coin.SoSeparator.OFF
+        except Exception:
+            self._scene_render_culling = None
+
+    def _attach_superimposition(self, view):
+        """Render outside model culling while retaining the active world camera."""
+        camera = None
+        camera_added = False
+        try:
+            viewer = view.getViewer()
+            render_manager = viewer.getSoRenderManager()
+            # A superimposition normally has HUD-style matrices. Including the
+            # live FreeCAD camera makes the shader's inverse matrices describe
+            # the same world view as the model, so the grid is not camera-flat.
+            camera = render_manager.getCamera()
+            if camera is None:
+                camera = view.getCameraNode()
+            if camera is not None:
+                self.root.insertChild(camera, 0)
+                camera_added = True
+                try:
+                    render_manager.setCamera(camera)
+                except Exception:
+                    pass
+            flags = self._SUPERIMPOSE_ZBUFFER | self._SUPERIMPOSE_AUTOREDRAW
+            superimposition = render_manager.addSuperimposition(self.root, flags)
+            if superimposition is None:
+                if camera_added:
+                    self.root.removeChild(camera)
+                return False
+            self.render_manager = render_manager
+            self.render_scene_graph = render_manager.getSceneGraph()
+            self.superimposition = superimposition
+            self.overlay_camera = camera
+            return True
+        except Exception:
+            if camera_added:
+                try:
+                    self.root.removeChild(camera)
+                except Exception:
+                    pass
+            self.render_manager = None
+            self.render_scene_graph = None
+            self.superimposition = None
+            self.overlay_camera = None
+            return False
 
     def apply_settings(self):
         """Push settings into shader uniforms. Call on change only."""
         color = QtGui.QColor(setting("color"))
         strength = setting("opacity")
         self.grid_color.value = (color.redF(), color.greenF(), color.blueF())
-        self.base_spacing.value = float(setting("base_spacing"))
+        self.base_spacing.value = float(grid_spacing_mm())
         self.minor_alpha.value = strength * 0.35
         self.major_alpha.value = strength
 
@@ -378,13 +487,22 @@ class ShaderGrid:
                     return False
         return True
 
+    def _own_doc(self):
+        """This grid's document: never a different active document."""
+        if self.doc_name:
+            try:
+                return App.getDocument(self.doc_name)
+            except Exception:
+                return None
+        return getattr(App, "ActiveDocument", None)
+
     def _footprints(self):
         """XY footprint of each visible solid-ish object.
 
-        Returns [(cx, cy, hx, hy, height, name)]. Per-object bounds are cached by
+        Returns [(cx, cy, hx, hy, ground_z, name)]. Per-object bounds are cached by
         shape hash, so unchanged objects cost almost nothing on later updates.
         """
-        doc = getattr(App, "ActiveDocument", None)
+        doc = self._own_doc()
         if not doc:
             return []
         out = []
@@ -396,19 +514,27 @@ class ShaderGrid:
                     continue
                 if obj.isDerivedFrom("Part::Datum"):    # datum planes etc.
                     continue
-                parent = obj.getParentGeoFeatureGroup()
+                if getattr(obj, "TypeId", "") in (
+                        "App::Part", "App::DocumentObjectGroup",
+                        "App::DocumentObjectGroupPython", "App::LinkGroup",
+                        "Assembly::AssemblyObject", "Assembly::AssemblyLink"):
+                    # A container's ViewObject bounds cover all of its
+                    # children and would create a false giant shadow.
+                    continue
+                try:
+                    parent = obj.getParentGeoFeatureGroup()
+                except Exception:
+                    parent = None
                 if parent is not None and parent.isDerivedFrom("PartDesign::Body"):
                     # Features inside a Body hold local-coordinate shapes; the
                     # Body itself represents them in world coordinates.
                     continue
                 if not self._shown(obj):
                     continue
-                gp = None               # world placement for objects in a Part
-                if parent is not None:
-                    gp = _world_placement(obj)
+                gp = _world_placement(obj)
                 key = None
                 try:
-                    key = (shape.hashCode(),
+                    key = (None if shape is None else shape.hashCode(),
                            None if gp is None else
                            (tuple(gp.Base), tuple(gp.Rotation.Q)))
                 except Exception:
@@ -423,13 +549,15 @@ class ShaderGrid:
                         has_faces = shape.countElement("Face") > 0
                     except Exception:
                         has_faces = True
-                    if has_faces:       # skips sketches, wires, empty shapes
+                    b = None
+                    if has_faces:       # skips sketches and wires
                         if gp is not None:
                             placed = shape.copy()
                             placed.Placement = gp
                             b = placed.BoundBox
                         else:
                             b = shape.BoundBox
+                    if b is not None:
                         if b.isValid():
                             vals = (b.XMin, b.YMin, b.ZMin, b.XMax, b.YMax, b.ZMax)
                             if all(math.isfinite(v) and abs(v) < 1e9 for v in vals):
@@ -439,10 +567,8 @@ class ShaderGrid:
                 if bounds is None:
                     continue
                 x0, y0, z0, x1, y1, z1 = bounds
-                if z1 < 0.0:            # entirely below the ground plane
-                    continue
                 out.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5,
-                            (x1 - x0) * 0.5, (y1 - y0) * 0.5, max(z1, 0.0),
+                            (x1 - x0) * 0.5, (y1 - y0) * 0.5, z0,
                             obj.Name))
             except Exception:
                 continue
@@ -451,15 +577,46 @@ class ShaderGrid:
                 del self._bounds_cache[name]
         return out
 
+    def _view_ground_z(self):
+        """Fallback ground elevation from FreeCAD's transformed view bounds."""
+        doc = self._own_doc()
+        if not doc:
+            return 0.0, False
+        values = []
+        for obj in getattr(doc, "Objects", []):
+            try:
+                if obj.isDerivedFrom("Part::Datum") or not self._shown(obj):
+                    continue
+                bounds = obj.ViewObject.getBoundingBox()
+                if bounds is not None and bounds.isValid():
+                    value = float(bounds.ZMin)
+                    if math.isfinite(value) and abs(value) < 1e9:
+                        values.append(value)
+            except Exception:
+                continue
+        return (min(values), bool(values)) if values else (0.0, False)
+
     def set_shadow_visible(self, visible):
         self.shadow_visible = bool(visible)
         self.update_shadow()
 
     def update_shadow(self):
         """Rebuild the shadow slots. Event driven, never polled."""
+        footprints = self._footprints()
+        if footprints:
+            ground_z = min(item[4] for item in footprints)
+            self.ground_ready = True
+        else:
+            ground_z, self.ground_ready = self._view_ground_z()
+        if not math.isfinite(ground_z):
+            ground_z = 0.0
+        if abs(ground_z - self._grid_z) > 1e-9:
+            self._grid_z = float(ground_z)
+            self.grid_z.value = self._grid_z
+
         if self.shadow_data is None:
             return
-        items = self._footprints() if self.shadow_visible else []
+        items = footprints if self.shadow_visible else []
         if not items:
             self.shadow_opacity.value = 0.0
             self.shadow_count.value = 0.0
@@ -468,7 +625,7 @@ class ShaderGrid:
         items.sort(key=lambda it: it[2] * it[3], reverse=True)
         items = items[:self.SHADOW_MAX]
         data = []
-        for cx, cy, hx, hy, height, _name in items:
+        for cx, cy, hx, hy, _ground_z, _name in items:
             hx = max(hx, 1e-4)
             hy = max(hy, 1e-4)
             # Keep four values per slot so the fragment uniform remains small
@@ -495,15 +652,52 @@ class ShaderGrid:
         if view is None:
             return False
         try:
-            return _same_ref(self.sg, view.getSceneGraph())
+            if self.superimposition is not None:
+                viewer = view.getViewer()
+                render_manager = viewer.getSoRenderManager()
+                if not _same_ref(self.render_scene_graph,
+                                 render_manager.getSceneGraph()):
+                    return False
+                current_camera = render_manager.getCamera()
+                return (current_camera is None or
+                        _same_ref(self.overlay_camera, current_camera))
+            if not _same_ref(self.sg, view.getSceneGraph()):
+                return False
+            try:
+                return self.sg.findChild(self.root) >= 0
+            except Exception:
+                for index in range(self.sg.getNumChildren()):
+                    if _same_ref(self.sg.getChild(index), self.root):
+                        return True
+                return False
         except Exception:
             return False
 
     def remove(self):
+        if self.superimposition is not None and self.render_manager is not None:
+            try:
+                self.render_manager.removeSuperimposition(self.superimposition)
+            except Exception:
+                pass
+            if self.overlay_camera is not None:
+                try:
+                    self.root.removeChild(self.overlay_camera)
+                except Exception:
+                    pass
+            self.superimposition = None
+            self.render_manager = None
+            self.render_scene_graph = None
+            self.overlay_camera = None
+            return
         try:
             self.sg.removeChild(self.root)
         except Exception:
             pass
+        if self._scene_render_culling is not None:
+            try:
+                self.sg.renderCulling = self._scene_render_culling
+            except Exception:
+                pass
 
 
 @_publish
@@ -527,6 +721,10 @@ class GridManager:
         self.shadow_timer.setSingleShot(True)
         self.shadow_timer.setInterval(150)
         self.shadow_timer.timeout.connect(self.update_shadow)
+        self.graph_timer = QtCore.QTimer(main)
+        self.graph_timer.setInterval(500)
+        self.graph_timer.timeout.connect(self.check_grid)
+        self.graph_timer.start()
         try:
             Gui.addDocumentObserver(self)
         except Exception:
@@ -559,6 +757,23 @@ class GridManager:
         return view if hasattr(view, "getSceneGraph") else None
 
     # -- grid lifecycle --------------------------------------------------
+    def check_grid(self):
+        """Repair an overlay removed while FreeCAD rebuilds a view graph."""
+        if not setting("enabled"):
+            return
+        doc = getattr(App, "ActiveDocument", None)
+        if doc is None:
+            return
+        view = self._view()
+        grid = self.items.get(doc.Name)
+        belongs = grid.belongs_to(view) if grid is not None else None
+        if grid is None or not belongs:
+            self.ensure_grid()
+        elif not grid.ground_ready:
+            # Some Assembly/import workflows populate geometry after the
+            # document activation/recompute callbacks have already fired.
+            grid.update_shadow()
+
     def ensure_grid(self, _retry=0):
         doc = getattr(App, "ActiveDocument", None)
         if doc is None:
@@ -577,7 +792,7 @@ class GridManager:
                         200, lambda: self.ensure_grid(_retry + 1))
                 return
             try:
-                grid = ShaderGrid(view)
+                grid = ShaderGrid(view, doc.Name)
             except Exception as exc:
                 App.Console.PrintWarning(
                     "Grid Overlay: could not attach grid: %s\n" % exc)
@@ -610,7 +825,10 @@ class GridManager:
 
     def update_shadow(self):
         try:
-            grid = self.items.get(App.ActiveDocument.Name)
+            doc = getattr(App, "ActiveDocument", None)
+            if doc is None:
+                return
+            grid = self.items.get(doc.Name)
             if grid:
                 grid.update_shadow()
         except Exception as exc:
@@ -625,7 +843,7 @@ class GridManager:
         self.schedule_shadow()
 
     def slotDeletedDocument(self, doc):
-        name = getattr(doc, "Name", None)
+        name = _doc_name(doc)
         if name is None:
             document = getattr(doc, "Document", None)
             name = getattr(document, "Name", None)
@@ -652,6 +870,10 @@ class GridManager:
             pass
         try:
             self.shadow_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.graph_timer.stop()
         except Exception:
             pass
         self.remove_grid()
@@ -694,8 +916,22 @@ class SettingsDialog(QtWidgets.QDialog):
         self.shadow_opacity.setRange(0, 100)
         self.shadow_opacity.setValue(int(setting("shadow_opacity") * 100))
         form.addRow("Ground shadow opacity", self.shadow_opacity)
-        self.spacing = QtWidgets.QDoubleSpinBox(); self.spacing.setRange(0.1, 100.0); self.spacing.setDecimals(2); self.spacing.setValue(setting("base_spacing"))
-        form.addRow("Base spacing scale", self.spacing)
+        self.unit = QtWidgets.QComboBox()
+        for key, label, _factor in GRID_UNIT_OPTIONS:
+            self.unit.addItem(label, key)
+        selected_unit = setting("grid_unit")
+        for index, (key, _label, _factor) in enumerate(GRID_UNIT_OPTIONS):
+            if key == selected_unit:
+                self.unit.setCurrentIndex(index)
+                break
+        form.addRow("Grid unit", self.unit)
+        self.spacing = QtWidgets.QDoubleSpinBox()
+        self.spacing.setRange(0.1, 100.0)
+        self.spacing.setDecimals(2)
+        self.spacing.setValue(setting("base_spacing"))
+        self.unit.currentIndexChanged.connect(self._update_spacing_suffix)
+        self._update_spacing_suffix()
+        form.addRow("Grid spacing", self.spacing)
         self.opacity = QtWidgets.QSlider(QT_HORIZONTAL); self.opacity.setRange(0, 100); self.opacity.setValue(int(setting("opacity")*100))
         form.addRow("Opacity", self.opacity)
         self.color = QtWidgets.QPushButton("Choose color…")
@@ -707,6 +943,10 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
         buttons.button(_dialog_button("Apply")).clicked.connect(self.apply)
         buttons.rejected.connect(self.reject)
+
+    def _update_spacing_suffix(self):
+        key = GRID_UNIT_OPTIONS[self.unit.currentIndex()][0]
+        self.spacing.setSuffix(" " + key)
 
     def _set_color_style(self):
         self.color.setStyleSheet("background-color: %s;" % self.color_value)
@@ -722,6 +962,7 @@ class SettingsDialog(QtWidgets.QDialog):
             "shadow_enabled": self.shadow_enabled.isChecked(),
             "shadow_opacity": self.shadow_opacity.value()/100.0,
             "base_spacing": self.spacing.value(),
+            "grid_unit": GRID_UNIT_OPTIONS[self.unit.currentIndex()][0],
             "opacity": self.opacity.value()/100.0,
             "color": self.color_value,
         })

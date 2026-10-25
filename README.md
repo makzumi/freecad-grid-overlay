@@ -4,18 +4,22 @@
 
 A lightweight, procedural grid overlay for the FreeCAD 3D viewport. The grid is
 drawn by a Coin3D/GLSL shader on a single full-screen quad — the fragment
-shader intersects each pixel's view ray with the z=0 plane and renders
-anti-aliased, level-of-detail-blended lines. There is no per-frame Python work:
-no camera sensor, no polling timer, no geometry rebuilds.
+shader intersects each pixel's view ray with the document ground plane and
+renders anti-aliased, level-of-detail-blended lines. There is no per-frame
+Python work or geometry rebuilds; a low-frequency lifecycle check only repairs
+attachment after FreeCAD rebuilds a view scene graph. The quad is rendered in
+an independent pass using FreeCAD's live camera, so model frustum culling
+cannot hide it when the model is panned off-screen while the grid remains
+world-aligned.
 
 An optional soft ground shadow is generated beneath visible document geometry,
 updated on demand from document events (never polled).
 
 ## Features
 
-- **Procedural grid** — infinite z=0 grid rendered in GLSL, with automatic
+- **Procedural grid** — infinite ground grid rendered in GLSL, with automatic
   level-of-detail blending between minor and major lines.
-- **Configurable appearance** — grid color, opacity, and base spacing scale.
+- **Configurable appearance** — grid color, opacity, unit, and spacing.
 - **Optional ground shadow** — soft radial-falloff shadow beneath visible
   geometry, with adjustable opacity.
 - **Pick-proof & unlit** — the overlay does not interfere with selection or
@@ -50,13 +54,18 @@ to open **Settings**:
 | Show custom grid     | Toggle the procedural grid overlay on/off.              |
 | Show ground shadow   | Toggle the optional soft shadow beneath geometry.       |
 | Ground shadow opacity| Opacity of the ground shadow.                            |
-| Base spacing scale   | Multiplier on the base grid spacing (0.1–100).           |
+| Grid unit            | Millimeters, centimeters, meters, inches, or feet.      |
+| Grid spacing         | Spacing expressed in the selected unit (0.1–100).       |
 | Opacity              | Overall grid opacity.                                    |
 | Grid color           | Color of the grid lines.                                 |
 
 The grid is shown automatically whenever a document is open and the overlay is
 enabled. It regenerates from the viewport's visible area as you navigate, and
 the shadow updates on geometry changes (debounced by 150 ms).
+
+FreeCAD's internal geometry coordinates are millimeters; the selected grid unit
+is converted to millimeters internally, so a spacing of `1` with **Inches**
+means 25.4 FreeCAD units.
 
 ## Requirements
 

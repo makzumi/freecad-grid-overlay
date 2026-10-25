@@ -1,8 +1,9 @@
 #version 120
-// Infinite anti-aliased grid on the z=0 plane, evaluated per pixel.
+// Infinite anti-aliased grid on the document ground plane, evaluated per pixel.
 // Zero CPU work per frame: spacing/LOD come from screen-space derivatives.
 uniform vec3  grid_color;
-uniform float base_spacing;   // world units of the finest "decade" unit
+uniform float base_spacing;   // millimeters in the finest "decade" unit
+uniform float grid_z;         // world-space elevation of the ground plane
 uniform float minor_alpha;
 uniform float major_alpha;
 // Per-object ground shadows. Slot i occupies SHADOW_STRIDE floats:
@@ -16,10 +17,12 @@ uniform float shadow_count;    // number of used slots
 uniform float shadow_opacity;  // 0 = off (no cost)
 
 varying vec3 v_near;
-varying vec3 v_far;
+varying vec3 v_camera;
+varying vec3 v_view_dir;
 
 const float MIN_PX     = 8.0;    // finest visible line spacing in pixels (approx.)
 const float DEPTH_BIAS = 1e-6;   // push grid slightly back so coplanar faces win
+const float MIN_PLANE_SLOPE = 0.05;
 const vec3  X_AXIS     = vec3(0.80, 0.20, 0.20);
 const vec3  Y_AXIS     = vec3(0.40, 0.70, 0.20);
 
@@ -58,15 +61,33 @@ float axis_line(float w, float dw)
 
 void main()
 {
-    // Ray through this pixel. Perspective rays start at the camera, so the
-    // grid is NOT limited to FreeCAD's near/far clip range (which is sized to
-    // the model). Orthographic rays are parallel; any t along them is valid.
-    vec3 dir = normalize(v_far - v_near);
+    // Ray through this pixel. Do not derive it from v_far: FreeCAD's far clip
+    // plane is sized from the model bounds and can become enormous when an
+    // object is dragged away. Interpolating that distant endpoint loses
+    // precision and turns the intersection into NaNs. The near point is
+    // sufficient for perspective directions, while orthographic views use
+    // the inverse-view direction directly.
     bool persp = gl_ProjectionMatrix[2][3] != 0.0;
-    vec3 origin = persp ? gl_ModelViewMatrixInverse[3].xyz : v_near;
-    float dz = dir.z;
-    if (abs(dz) < 1e-8) dz = 1e-8;
-    float t = -origin.z / dz;
+    vec3 origin = persp ? v_camera : v_near;
+    vec3 dir = persp ? normalize(v_near - v_camera) : normalize(v_view_dir);
+    float plane_delta = grid_z - origin.z;
+    // Perspective rays start at the camera, so a ray pointing away from the
+    // plane can never reach it (sky above the horizon). Orthographic rays
+    // are parallel and conceptually infinite: v_near sits on FreeCAD's near
+    // plane, which tracks the scene bounds and can legitimately lie on the
+    // far side of the ground plane. Discarding those pixels would cut the
+    // grid out of part of the viewport; a negative t is valid because the
+    // ortho projection stays linear along the whole ray, and the depth test
+    // still lets scene geometry occlude the grid correctly.
+    if (persp && dir.z * plane_delta <= 0.0)
+        discard;
+    bool extended = abs(dir.z) < MIN_PLANE_SLOPE;
+    if (extended) {
+        float toward_plane = plane_delta < 0.0 ? -1.0 : 1.0;
+        dir.z = toward_plane * max(abs(dir.z), MIN_PLANE_SLOPE);
+        dir = normalize(dir);
+    }
+    float t = plane_delta / dir.z;
     vec3  p = origin + t * dir;
 
     // All derivatives first, so discards below cannot corrupt them.
@@ -78,11 +99,10 @@ void main()
     float ay = axis_line(p.x, fwidth(p.x));   // y axis (x == 0)
 
     // Fade toward the horizon where the plane goes edge-on.
-    float grazing = smoothstep(0.0, 0.08, abs(dir.z));
+    float grazing = max(0.15, smoothstep(0.0, 0.025, abs(dir.z)));
 
     vec4 clip = gl_ModelViewProjectionMatrix * vec4(p, 1.0);
-    // Perspective: t < 0 means the plane is behind the camera (sky).
-    if ((persp && t < 0.0) || clip.w <= 0.0)
+    if (clip.w <= 0.0)
         discard;
 
     float a   = max(gx, gy);
@@ -122,6 +142,7 @@ void main()
     gl_FragColor = vec4(orgb, oa);
     // Clamp instead of clip: grid outside the near/far range still draws,
     // pinned to the depth limits so model geometry keeps occluding it.
-    float depth = clip.z / clip.w * 0.5 + 0.5 + DEPTH_BIAS;
+    float depth = extended ? 0.999999 :
+        clip.z / clip.w * 0.5 + 0.5 + DEPTH_BIAS;
     gl_FragDepth = clamp(depth, 0.0, 0.999999);
 }
