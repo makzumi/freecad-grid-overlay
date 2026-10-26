@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Grid Overlay add-on for FreeCAD (legacy Mod-folder layout).
+"""Grid Overlay add-on for FreeCAD's modern namespaced layout.
 
 The grid is a single full-screen quad drawn by a GLSL shader: the fragment
 shader intersects each pixel's view ray with the model ground plane and draws
@@ -14,9 +14,9 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from pivy import coin
 
-# FreeCAD's directory-module loader executes this file inside a function. Make
-# the imports needed by helper functions visible in the module globals before
-# calling those helpers during startup.
+# FreeCAD supports both exec-style startup modules and normal Python module
+# imports. Publish the host modules explicitly so the helper functions behave
+# the same way in either loading mode.
 globals().update({"App": App, "importlib": importlib})
 
 
@@ -53,13 +53,32 @@ globals().update({
     "Signal": Signal,
 })
 
-try:
-    ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    # FreeCAD evaluates InitGui.py with exec(), without defining __file__.
-    ADDON_DIR = os.path.join(App.getUserAppDataDir(), "Mod", "GridOverlay")
+def _addon_root():
+    """Find the installed addon root without assuming its folder name.
+
+    Modern FreeCAD addons are loaded from
+    ``<addon-root>/freecad/<module>/init_gui.py`` and receive ``__file__``.
+    Walk upward until the manifest is found so the repository can be copied,
+    symlinked, or renamed freely.
+    """
+    try:
+        current = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        raise RuntimeError(
+            "Grid Overlay requires FreeCAD's modern namespaced addon layout")
+    for _ in range(6):
+        if os.path.isfile(os.path.join(current, "package.xml")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise RuntimeError("Grid Overlay package.xml was not found above %s" % current)
+
+
+ADDON_DIR = _addon_root()
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
-MANAGER_VERSION = 37
+MANAGER_VERSION = 38
 
 
 def _doc_name(doc):
@@ -122,9 +141,10 @@ def _dialog_button(name):
 
 QT_HORIZONTAL = _qt_enum("Horizontal")
 
-# FreeCAD's directory-module loader executes this file inside a function. In
-# that mode, names assigned by exec() are not visible to functions/classes
-# created by the exec unless they are explicitly published to its globals.
+# In exec-style startup loading, names assigned by exec() are not visible to
+# functions/classes created by the exec unless they are explicitly published
+# to its globals. This is harmless for normal package imports and preserves
+# compatibility with FreeCAD's older loader.
 globals().update({
     "os": os, "math": math,
     "App": App, "Gui": Gui, "coin": coin,

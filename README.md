@@ -34,15 +34,27 @@ updated on demand from document events (never polled).
 
 ## Installation
 
-Place the `GridOverlay` folder in your FreeCAD user `Mod` directory, then
-restart FreeCAD. The usual locations are:
+Place the addon root (the folder containing `package.xml`) anywhere inside your
+FreeCAD user `Mod` directory, then restart FreeCAD. The outer folder can be
+renamed or installed as a symlink; the addon resolves its resources from its
+own package location. The usual `Mod` locations are:
 
 - **Windows:** `%APPDATA%\FreeCAD\Mod` (typically `C:\Users\<username>\AppData\Roaming\FreeCAD\Mod`)
 - **Linux:** `~/.local/share/FreeCAD/Mod`
 - **macOS:** `~/Library/Preferences/FreeCAD/Mod`
 
 Some FreeCAD builds use a version-specific user directory; in that case, use
-the `Mod` folder inside that directory.
+the `Mod` folder inside that directory. The modern package layout is:
+
+```text
+GridOverlay/
+├── package.xml
+├── Resources/
+└── freecad/
+    └── GridOverlay/
+        ├── __init__.py
+        └── init_gui.py
+```
 
 ## Usage
 

@@ -22,7 +22,14 @@ varying vec3 v_view_dir;
 
 const float MIN_PX     = 8.0;    // finest visible line spacing in pixels (approx.)
 const float DEPTH_BIAS = 1e-6;   // push grid slightly back so coplanar faces win
-const float MIN_PLANE_SLOPE = 0.05;
+// Below this slope the plane intersection becomes numerically unstable: a
+// one-pixel change in the view ray can move the hit point many kilometres.
+// Fade the grid into the horizon and never replace the ray with a made-up
+// slope. The old replacement was the source of stretched/incorrect grid
+// patches while orbiting near edge-on views.
+const float MIN_PLANE_SLOPE  = 0.025;
+const float FADE_PLANE_SLOPE = 0.10;
+const float MAX_RAY_DISTANCE  = 1e8; // 100 km in FreeCAD's millimetres
 const vec3  X_AXIS     = vec3(0.80, 0.20, 0.20);
 const vec3  Y_AXIS     = vec3(0.40, 0.70, 0.20);
 
@@ -81,13 +88,15 @@ void main()
     // still lets scene geometry occlude the grid correctly.
     if (persp && dir.z * plane_delta <= 0.0)
         discard;
-    bool extended = abs(dir.z) < MIN_PLANE_SLOPE;
-    if (extended) {
-        float toward_plane = plane_delta < 0.0 ? -1.0 : 1.0;
-        dir.z = toward_plane * max(abs(dir.z), MIN_PLANE_SLOPE);
-        dir = normalize(dir);
-    }
+    float plane_slope = abs(dir.z);
+    if (plane_slope < MIN_PLANE_SLOPE)
+        discard;
     float t = plane_delta / dir.z;
+    // Keep very distant intersections out of the derivative and depth math.
+    // This is only a numerical guard; ordinary model extents are many orders
+    // of magnitude smaller than this limit.
+    if (abs(t) > MAX_RAY_DISTANCE)
+        discard;
     vec3  p = origin + t * dir;
 
     // All derivatives first, so discards below cannot corrupt them.
@@ -98,8 +107,11 @@ void main()
     float ax = axis_line(p.y, fwidth(p.y));   // x axis (y == 0)
     float ay = axis_line(p.x, fwidth(p.x));   // y axis (x == 0)
 
-    // Fade toward the horizon where the plane goes edge-on.
-    float grazing = max(0.15, smoothstep(0.0, 0.025, abs(dir.z)));
+    // Fade toward the horizon where the plane goes edge-on. Keeping this
+    // separate from the intersection is important: alpha may be reduced,
+    // but the world-space hit point must never be altered to achieve it.
+    float grazing = smoothstep(MIN_PLANE_SLOPE, FADE_PLANE_SLOPE,
+                               plane_slope);
 
     vec4 clip = gl_ModelViewProjectionMatrix * vec4(p, 1.0);
     if (clip.w <= 0.0)
@@ -142,7 +154,6 @@ void main()
     gl_FragColor = vec4(orgb, oa);
     // Clamp instead of clip: grid outside the near/far range still draws,
     // pinned to the depth limits so model geometry keeps occluding it.
-    float depth = extended ? 0.999999 :
-        clip.z / clip.w * 0.5 + 0.5 + DEPTH_BIAS;
+    float depth = clip.z / clip.w * 0.5 + 0.5 + DEPTH_BIAS;
     gl_FragDepth = clamp(depth, 0.0, 0.999999);
 }

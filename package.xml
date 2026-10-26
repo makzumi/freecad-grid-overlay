@@ -3,6 +3,7 @@
   <name>Grid Overlay</name>
   <version>1.1.0</version>
   <date>2026-10-19</date>
+  <freecadmin>26.0</freecadmin>
   <description>Procedural viewport grid with optional ground shadows.</description>
   <maintainer email="makzumi@gmail.com">makzumi</maintainer>
   <license file="LICENSE">MIT</license>
@@ -13,12 +14,8 @@
   <tag>viewport</tag>
   <tag>extension</tag>
 
+  <!-- A workbench-less addon with a global GUI command. -->
   <content>
-    <other>
-      <name>Grid Overlay</name>
-      <description>Global toolbar command that configures a procedural viewport grid.</description>
-      <freecadmin>26.0</freecadmin>
-      <subdirectory>./</subdirectory>
-    </other>
+    <other/>
   </content>
 </package>
