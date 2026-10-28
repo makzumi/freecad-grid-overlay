@@ -480,7 +480,8 @@ class ShaderGrid:
         self.major_alpha.value = strength
 
     SHADOW_MAX = 8           # must match SHADOW_MAX in grid.frag.glsl
-    SHADOW_STRIDE = 4        # packed centre + half extents
+    SHADOW_STRIDE = 5        # packed centre, half extents, and corner mask
+    SHADOW_CLUSTER_GAP = 0.15
 
     @staticmethod
     def _shown(obj, depth=0):
@@ -597,6 +598,110 @@ class ShaderGrid:
                 del self._bounds_cache[name]
         return out
 
+    @staticmethod
+    def _cluster_footprints(footprints):
+        """Merge nearby footprints while preserving each cluster's XY outline."""
+        parents = list(range(len(footprints)))
+
+        def find(index):
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        for i, first in enumerate(footprints):
+            first_hx = max(first[2], 1e-4)
+            first_hy = max(first[3], 1e-4)
+            ax0, ay0 = first[0] - first_hx, first[1] - first_hy
+            ax1, ay1 = first[0] + first_hx, first[1] + first_hy
+            first_size = max(ax1 - ax0, ay1 - ay0)
+            for j in range(i + 1, len(footprints)):
+                second = footprints[j]
+                second_hx = max(second[2], 1e-4)
+                second_hy = max(second[3], 1e-4)
+                bx0, by0 = second[0] - second_hx, second[1] - second_hy
+                bx1, by1 = second[0] + second_hx, second[1] + second_hy
+                gap_x = max(0.0, ax0 - bx1, bx0 - ax1)
+                gap_y = max(0.0, ay0 - by1, by0 - ay1)
+                second_size = max(bx1 - bx0, by1 - by0)
+                gap_limit = (ShaderGrid.SHADOW_CLUSTER_GAP *
+                             min(first_size, second_size))
+                if math.hypot(gap_x, gap_y) <= gap_limit:
+                    first_root = find(i)
+                    second_root = find(j)
+                    if first_root != second_root:
+                        parents[second_root] = first_root
+
+        grouped = {}
+        for index, item in enumerate(footprints):
+            half_x = max(item[2], 1e-4)
+            half_y = max(item[3], 1e-4)
+            x0, y0 = item[0] - half_x, item[1] - half_y
+            x1, y1 = item[0] + half_x, item[1] + half_y
+            root = find(index)
+            if root not in grouped:
+                grouped[root] = [[(x0, y0, x1, y1)], item[4], {item[5]}]
+            else:
+                bounds, ground_z, names = grouped[root]
+                bounds.append((x0, y0, x1, y1))
+                grouped[root] = [bounds, min(ground_z, item[4]),
+                                 names | {item[5]}]
+
+        result = []
+        for bounds, ground_z, names in grouped.values():
+            x_edges = sorted({value for x0, _y0, x1, _y1 in bounds
+                              for value in (x0, x1)})
+            active = {}
+            rectangles = []
+            for x0, x1 in zip(x_edges, x_edges[1:]):
+                intervals = sorted((y0, y1) for bx0, y0, bx1, y1 in bounds
+                                   if bx0 <= x0 and bx1 >= x1)
+                merged = []
+                for y0, y1 in intervals:
+                    if merged and y0 <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], y1)
+                    else:
+                        merged.append([y0, y1])
+                current = {tuple(interval) for interval in merged}
+                for interval, start_x in list(active.items()):
+                    if interval not in current:
+                        rectangles.append((start_x, x0, interval[0], interval[1]))
+                        del active[interval]
+                for interval in current:
+                    if interval not in active:
+                        active[interval] = x0
+            for interval, start_x in active.items():
+                rectangles.append((start_x, x_edges[-1],
+                                   interval[0], interval[1]))
+            for x0, x1, y0, y1 in rectangles:
+                delta = max(min(x1 - x0, y1 - y0) * 1e-6, 1e-8)
+                corner_mask = 0
+                corners = (
+                    (x0, y0, 1, 1, 1),
+                    (x1, y0, -1, 1, 2),
+                    (x0, y1, 1, -1, 4),
+                    (x1, y1, -1, -1, 8),
+                )
+                for x, y, direction_x, direction_y, bit in corners:
+                    quadrants = (
+                        (x - delta, y - delta),
+                        (x + delta, y - delta),
+                        (x - delta, y + delta),
+                        (x + delta, y + delta),
+                    )
+                    occupied = [any(bx0 < qx < bx1 and by0 < qy < by1
+                                    for bx0, by0, bx1, by1 in bounds)
+                                for qx, qy in quadrants]
+                    interior = ((1 if direction_x > 0 else 0) +
+                                (2 if direction_y > 0 else 0))
+                    if sum(occupied) == 1 and occupied[interior]:
+                        corner_mask |= bit
+                result.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5,
+                               (x1 - x0) * 0.5, (y1 - y0) * 0.5,
+                               ground_z, ", ".join(sorted(names)),
+                               corner_mask))
+        return result
+
     def _view_ground_z(self):
         """Fallback ground elevation from FreeCAD's transformed view bounds."""
         doc = self._own_doc()
@@ -621,42 +726,39 @@ class ShaderGrid:
         self.update_shadow()
 
     def update_shadow(self):
-        """Rebuild the shadow slots. Event driven, never polled."""
+        """Rebuild shadow slots while keeping the grid on world Z=0."""
         footprints = self._footprints()
         if footprints:
-            ground_z = min(item[4] for item in footprints)
             self.ground_ready = True
         else:
-            ground_z, self.ground_ready = self._view_ground_z()
-        if not math.isfinite(ground_z):
-            ground_z = 0.0
-        if abs(ground_z - self._grid_z) > 1e-9:
-            self._grid_z = float(ground_z)
-            self.grid_z.value = self._grid_z
+            _view_ground_z, self.ground_ready = self._view_ground_z()
+        if self._grid_z != 0.0:
+            self._grid_z = 0.0
+            self.grid_z.value = 0.0
 
         if self.shadow_data is None:
             return
-        items = footprints if self.shadow_visible else []
+        items = self._cluster_footprints(footprints) if self.shadow_visible else []
         if not items:
             self.shadow_opacity.value = 0.0
             self.shadow_count.value = 0.0
             return
-        # Keep the largest footprints if there are more than the shader holds.
+        # Keep the largest rectangle pieces if there are more than the slots.
         items.sort(key=lambda it: it[2] * it[3], reverse=True)
         items = items[:self.SHADOW_MAX]
         data = []
-        for cx, cy, hx, hy, _ground_z, _name in items:
+        for cx, cy, hx, hy, _ground_z, _name, corner_mask in items:
             hx = max(hx, 1e-4)
             hy = max(hy, 1e-4)
-            # Keep four values per slot so the fragment uniform remains small
-            # enough for older OpenGL implementations.  The blur scales with
-            # footprint; the geometry height is intentionally not uploaded.
-            data.extend((cx, cy, hx, hy))
+            # Keep five values per slot so the fragment uniform remains small
+            # enough for older OpenGL implementations. Geometry height is not
+            # needed by the screen-space shadow feather.
+            data.extend((cx, cy, hx, hy, corner_mask))
         data.extend([0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE - len(data)))
         _set_mf_floats(self.shadow_data.value, data)
         self.shadow_count.value = float(len(items))
         self.shadow_opacity.value = float(setting("shadow_opacity"))
-        names = tuple(it[5] for it in items)
+        names = tuple(sorted({it[5] for it in items}))
         if names != self._last_shadow_names:        # Report view "Log" level
             self._last_shadow_names = names
             App.Console.PrintLog(

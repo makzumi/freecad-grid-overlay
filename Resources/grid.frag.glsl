@@ -6,12 +6,14 @@ uniform float base_spacing;   // millimeters in the finest "decade" unit
 uniform float grid_z;         // world-space elevation of the ground plane
 uniform float minor_alpha;
 uniform float major_alpha;
-// Per-object ground shadows. Slot i occupies SHADOW_STRIDE floats:
-//   centre x, centre y, half-width, half-depth (world units)
+// Per-cluster ground shadows. Slot i occupies SHADOW_STRIDE floats:
+//   centre x/y, half-width/depth, convex-corner mask
 // The compact layout keeps the shader linkable on OpenGL implementations with
-// smaller fragment-uniform limits; the blur is derived from the footprint.
+// smaller fragment-uniform limits; the feather is measured in screen pixels.
 const int SHADOW_MAX    = 8;
-const int SHADOW_STRIDE = 4;
+const int SHADOW_STRIDE = 5;
+const float SHADOW_FEATHER_PX = 30.0;
+const float SHADOW_CORNER_RADIUS_PX = 30.0;
 uniform float shadow_data[SHADOW_MAX * SHADOW_STRIDE];
 uniform float shadow_count;    // number of used slots
 uniform float shadow_opacity;  // 0 = off (no cost)
@@ -123,7 +125,7 @@ void main()
     rgb = mix(rgb, Y_AXIS, ay);  a = max(a, ay * major_alpha);
     a *= grazing;
 
-    // Soft per-object ground shadows: one ellipse per object footprint,
+    // Soft ground shadows: rectangle unions preserve each cluster's outline,
     // composited under the lines in the same pass / depth test as the grid.
     float sa = 0.0;
     if (shadow_opacity > 0.0 && shadow_count > 0.5) {
@@ -133,12 +135,19 @@ void main()
             int o = i * SHADOW_STRIDE;
             vec2  c    = vec2(shadow_data[o],     shadow_data[o + 1]);
             vec2  h    = vec2(shadow_data[o + 2], shadow_data[o + 3]);
-            float blur = max(0.3 * min(h.x, h.y), 1e-6);
-            vec2  q    = p.xy - c;
-            // Approximate signed distance to an axis-aligned ellipse.
-            float k0   = length(q / h);
-            float k1   = length(q / (h * h));
-            float sdf  = k0 * (k0 - 1.0) / max(k1, 1e-9);
+            float corner_mask = shadow_data[o + 4];
+            float corner_bit = p.x < c.x
+                ? (p.y < c.y ? 1.0 : 4.0)
+                : (p.y < c.y ? 2.0 : 8.0);
+            float rounded_corner = mod(floor(corner_mask / corner_bit), 2.0);
+            float pixel_world = max(fwidth(p.x), fwidth(p.y));
+            float radius = rounded_corner * min(
+                SHADOW_CORNER_RADIUS_PX * pixel_world, min(h.x, h.y));
+            vec2  q      = abs(p.xy - c) - (h - vec2(radius));
+            float sdf    = length(max(q, vec2(0.0))) +
+                           min(max(q.x, q.y), 0.0) - radius;
+            float blur   = max(max(fwidth(p.x), fwidth(p.y)) *
+                               SHADOW_FEATHER_PX, 1e-6);
             if (sdf > blur * 1.6)
                 continue;
             float k = max(sdf, 0.0) / blur;     // 0 at/inside the footprint
