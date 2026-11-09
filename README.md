@@ -12,16 +12,23 @@ an independent pass using FreeCAD's live camera, so model frustum culling
 cannot hide it when the model is panned off-screen while the grid remains
 world-aligned.
 
-An optional soft ground shadow is generated beneath visible document geometry,
-updated on demand from document events (never polled).
+An optional soft ground shadow follows the real top-down footprint of the
+visible geometry. It is rebuilt on demand from document events (never polled):
+shapes are projected onto the ground, rasterized into a blurred mask with
+numpy, and sampled by the same shader as a texture.
 
 ## Features
 
 - **Procedural grid** — infinite ground grid rendered in GLSL, with automatic
   level-of-detail blending between minor and major lines.
-- **Configurable appearance** — grid color, opacity, unit, and spacing.
-- **Optional ground shadow** — soft radial-falloff shadow beneath visible
-  geometry, with adjustable opacity.
+- **Side-view grids** — when the camera looks dead-on from the front, rear,
+  left or right, the grid switches to the matching vertical plane (XZ or YZ)
+  and is drawn as a backdrop behind the model. Any other view uses the ground.
+- **Configurable appearance** — grid color, opacity, unit, spacing, ground
+  height, and axis lines.
+- **Optional ground shadow** — soft contact shadow that follows each object's
+  footprint (L-shapes, cylinders, rotated parts), with adjustable opacity,
+  spread and softness.
 - **Pick-proof & unlit** — the overlay does not interfere with selection or
   picking, and uses a base-color light model so it is unaffected by scene
   lighting.
@@ -61,23 +68,33 @@ GridOverlay/
 The **Grid Overlay** toolbar appears in the main window. Click the grid button
 to open **Settings**:
 
-| Setting              | Description                                              |
-| -------------------- | -------------------------------------------------------- |
-| Show custom grid     | Toggle the procedural grid overlay on/off.              |
-| Show ground shadow   | Toggle the optional soft shadow beneath geometry.       |
-| Ground shadow opacity| Opacity of the ground shadow.                            |
-| Grid unit            | Millimeters, centimeters, meters, inches, or feet.      |
-| Grid spacing         | Spacing expressed in the selected unit (0.1–100).       |
-| Opacity              | Overall grid opacity.                                    |
-| Grid color           | Color of the grid lines.                                 |
+| Setting                 | Description                                                    |
+| ----------------------- | -------------------------------------------------------------- |
+| Show custom grid        | Toggle the procedural grid overlay on/off.                     |
+| Grid unit               | Millimeters, centimeters, meters, inches, or feet.             |
+| Grid spacing            | Spacing expressed in the selected unit (0.1–100).              |
+| Ground height (Z)       | World Z of the ground grid and its shadow, in the selected unit. |
+| Opacity                 | Overall grid opacity.                                          |
+| Grid color              | Color of the grid lines.                                       |
+| Show axis lines         | Draw the colored X/Y/Z axis lines.                             |
+| Grid in front / rear / left / right views | Use a vertical grid when looking straight along X or Y. |
+| Show ground shadow      | Toggle the soft footprint shadow beneath geometry.             |
+| Shadow opacity          | Opacity of the ground shadow.                                  |
+| Shadow spread           | How far the shadow grows beyond the footprint before fading, so parts resting on the ground still show a rim. |
+| Shadow softness         | How gradually the shadow edge fades out.                       |
+
+**Restore Defaults** resets the dialog; nothing is saved until **Apply**.
 
 The grid is shown automatically whenever a document is open and the overlay is
 enabled. It regenerates from the viewport's visible area as you navigate, and
-the shadow updates on geometry changes (debounced by 150 ms).
+the shadow updates on geometry and placement changes (throttled to 150 ms).
+Shadow triangles are cached per object, so moving one part only re-tessellates
+that part.
 
 FreeCAD's internal geometry coordinates are millimeters; the selected grid unit
 is converted to millimeters internally, so a spacing of `1` with **Inches**
-means 25.4 FreeCAD units.
+means 25.4 FreeCAD units. The ground height is stored in millimeters, so
+switching units keeps the same physical height.
 
 ## Requirements
 
@@ -85,6 +102,8 @@ means 25.4 FreeCAD units.
 - FreeCAD's bundled PySide compatibility module, PySide2, or PySide6 for the
   settings dialog
 - `pivy` (Coin3D) for the scene-graph nodes
+- `numpy` (bundled with FreeCAD) for ground shadows; without it the grid still
+  works and the shadow options are disabled
 
 The add-on keeps its FreeCAD-facing code on APIs shared by 26.x and 27.x. At
 startup it detects the host release and warns if it is outside those validated

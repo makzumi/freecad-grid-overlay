@@ -14,6 +14,11 @@ import FreeCAD as App
 import FreeCADGui as Gui
 from pivy import coin
 
+try:
+    import numpy as np
+except Exception:       # shadows need numpy; the grid itself does not
+    np = None
+
 # FreeCAD supports both exec-style startup modules and normal Python module
 # imports. Publish the host modules explicitly so the helper functions behave
 # the same way in either loading mode.
@@ -78,7 +83,6 @@ def _addon_root():
 
 ADDON_DIR = _addon_root()
 SETTINGS = QtCore.QSettings("GridOverlay", "GridOverlay")
-MANAGER_VERSION = 38
 
 
 def _doc_name(doc):
@@ -146,11 +150,11 @@ QT_HORIZONTAL = _qt_enum("Horizontal")
 # to its globals. This is harmless for normal package imports and preserves
 # compatibility with FreeCAD's older loader.
 globals().update({
-    "os": os, "math": math,
+    "os": os, "math": math, "np": np,
     "App": App, "Gui": Gui, "coin": coin,
     "QtCore": QtCore, "QtGui": QtGui, "QtWidgets": QtWidgets,
     "Signal": Signal, "ADDON_DIR": ADDON_DIR, "SETTINGS": SETTINGS,
-    "MANAGER_VERSION": MANAGER_VERSION, "QT_HORIZONTAL": QT_HORIZONTAL,
+    "QT_HORIZONTAL": QT_HORIZONTAL,
     "_dialog_button": _dialog_button,
 })
 
@@ -208,8 +212,20 @@ DEFAULTS = {
     "grid_unit": "mm",
     "shadow_enabled": True,
     "shadow_opacity": 0.30,
+    "shadow_softness": 0.45,
+    "shadow_spread": 0.02,
+    "grid_z_offset": 0.0,       # millimeters, independent of the grid unit
+    "side_planes": True,
+    "axis_lines": True,
 }
-globals()["DEFAULTS"] = DEFAULTS
+BOOL_SETTINGS = ("enabled", "shadow_enabled", "side_planes", "axis_lines")
+UNIT_SETTINGS = ("opacity", "shadow_opacity", "shadow_softness",
+                 "shadow_spread")
+_settings_cache = {}
+globals().update({
+    "DEFAULTS": DEFAULTS, "BOOL_SETTINGS": BOOL_SETTINGS,
+    "UNIT_SETTINGS": UNIT_SETTINGS, "_settings_cache": _settings_cache,
+})
 
 GRID_UNIT_OPTIONS = (
     ("mm", "Millimeters", 1.0),
@@ -226,25 +242,43 @@ globals().update({
 })
 
 
-@_publish
-def setting(key):
-    value = SETTINGS.value(key, DEFAULTS[key])
-    if key in ("enabled", "shadow_enabled"):
+def _parse_setting(key, value):
+    """Validate a raw QSettings value (strings on some platforms)."""
+    if key in BOOL_SETTINGS:
         if isinstance(value, bool):
             return value
         return str(value).lower() in ("true", "1", "yes", "on")
     if key == "grid_unit":
         value = str(value).strip().lower()
         return value if value in GRID_UNIT_FACTORS else DEFAULTS[key]
-    if key in ("opacity", "shadow_opacity", "base_spacing"):
+    if isinstance(DEFAULTS[key], float):
         try:
             result = float(value)
         except Exception:
             return DEFAULTS[key]
+        if not math.isfinite(result):
+            return DEFAULTS[key]
         if key == "base_spacing":
             return max(0.01, min(100.0, result))
+        if key == "grid_z_offset":
+            return max(-1e7, min(1e7, result))
         return max(0.0, min(1.0, result))
     return str(value)
+
+
+globals()["_parse_setting"] = _parse_setting
+
+
+@_publish
+def setting(key):
+    """Read a validated setting. Values are cached: the lifecycle timer and
+    shadow updates call this often, and only save_settings changes them."""
+    try:
+        return _settings_cache[key]
+    except KeyError:
+        value = _parse_setting(key, SETTINGS.value(key, DEFAULTS[key]))
+        _settings_cache[key] = value
+        return value
 
 
 @_publish
@@ -257,6 +291,7 @@ def grid_spacing_mm():
 def save_settings(values):
     for key, value in values.items():
         SETTINGS.setValue(key, value)
+        _settings_cache.pop(key, None)
     SETTINGS.sync()
 
 
@@ -290,17 +325,90 @@ def _depth_no_write():
 globals()["_depth_no_write"] = _depth_no_write
 
 
-def _set_mf_floats(field, values):
-    """Fill an SoMFFloat from a Python list (setValues, else per element)."""
-    try:
-        field.setValues(0, len(values), values)
-    except Exception:
-        for i, v in enumerate(values):
-            field.set1Value(i, v)
-    field.setNum(len(values))
+def _pow2_at_least(value):
+    """Smallest power of two >= value (at least 8)."""
+    size = 8
+    while size < value:
+        size *= 2
+    return size
 
 
-globals()["_set_mf_floats"] = _set_mf_floats
+def _rasterize_triangles(tris, width, height):
+    """Boolean coverage mask of 2-D triangles given in pixel coordinates.
+
+    tris is an (N, 3, 2) array. Vectorised scanline conversion: one entry
+    per (triangle, covered pixel row), with each row's span accumulated in a
+    difference array, so there is no per-triangle Python loop.
+    """
+    mask = np.zeros((height, width), dtype=bool)
+    if not len(tris):
+        return mask
+    ys = tris[:, :, 1]
+    first = np.maximum(np.ceil(ys.min(axis=1) - 0.5), 0).astype(np.int64)
+    last = np.minimum(np.floor(ys.max(axis=1) - 0.5), height - 1).astype(np.int64)
+    counts = np.maximum(last - first + 1, 0)
+    total = int(counts.sum())
+    if total == 0:
+        return mask
+    tri = np.repeat(np.arange(len(tris)), counts)
+    starts = np.cumsum(counts) - counts
+    rows = first[tri] + (np.arange(total) - starts[tri])
+    yc = rows + 0.5                                  # pixel-centre rows
+    left = np.full(total, np.inf)
+    right = np.full(total, -np.inf)
+    for a, b in ((0, 1), (1, 2), (2, 0)):
+        xa, ya = tris[tri, a, 0], tris[tri, a, 1]
+        xb, yb = tris[tri, b, 0], tris[tri, b, 1]
+        dy = yb - ya
+        hit = ((np.minimum(ya, yb) <= yc) & (yc <= np.maximum(ya, yb)) &
+               (dy != 0))
+        x = xa + (yc - ya) * (xb - xa) / np.where(hit, dy, 1.0)
+        left = np.where(hit, np.minimum(left, x), left)
+        right = np.where(hit, np.maximum(right, x), right)
+    c0 = np.ceil(left - 0.5)
+    c1 = np.floor(right - 0.5)
+    ok = np.isfinite(c0) & np.isfinite(c1)
+    rows = rows[ok]
+    c0 = np.maximum(c0[ok], 0).astype(np.int64)
+    c1 = np.minimum(c1[ok], width - 1).astype(np.int64)
+    keep = c1 >= c0
+    rows, c0, c1 = rows[keep], c0[keep], c1[keep]
+    diff = np.zeros((height, width + 1), dtype=np.int32)
+    np.add.at(diff, (rows, c0), 1)
+    np.add.at(diff, (rows, c1 + 1), -1)
+    mask[:] = np.cumsum(diff[:, :width], axis=1) > 0
+    return mask
+
+
+def _box_blur(img, radius, axis):
+    """Box filter of width 2*radius+1 along one axis (zero padded)."""
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (radius + 1, radius)
+    summed = np.cumsum(np.pad(img, pad), axis=axis)
+    count = img.shape[axis]
+    width = 2 * radius + 1
+    upper = np.take(summed, np.arange(width, width + count), axis=axis)
+    lower = np.take(summed, np.arange(0, count), axis=axis)
+    return (upper - lower) / float(width)
+
+
+def _gaussian_blur(img, sigma):
+    """Three box passes per axis approximate a Gaussian of this sigma."""
+    out = img.astype(np.float32)
+    radius = int(round((math.sqrt(4.0 * sigma * sigma + 1.0) - 1.0) * 0.5))
+    if radius < 1:
+        return out
+    for axis in (0, 1):
+        for _ in range(3):
+            out = _box_blur(out, radius, axis)
+    return out
+
+
+globals().update({
+    "_pow2_at_least": _pow2_at_least,
+    "_rasterize_triangles": _rasterize_triangles,
+    "_box_blur": _box_blur, "_gaussian_blur": _gaussian_blur,
+})
 
 
 @_publish
@@ -342,36 +450,44 @@ class ShaderGrid:
         self.grid_z = coin.SoShaderParameter1f()
         self.grid_z.name = "grid_z"
         self.grid_z.value = 0.0
-        self._grid_z = 0.0
         self.minor_alpha = coin.SoShaderParameter1f()
         self.minor_alpha.name = "minor_alpha"
         self.major_alpha = coin.SoShaderParameter1f()
         self.major_alpha.name = "major_alpha"
-        self.shadow_count = coin.SoShaderParameter1f()
-        self.shadow_count.name = "shadow_count"
-        self.shadow_count.value = 0.0
+        self.side_planes = coin.SoShaderParameter1f()
+        self.side_planes.name = "side_planes"
+        self.axis_lines = coin.SoShaderParameter1f()
+        self.axis_lines.name = "axis_lines"
         self.shadow_opacity = coin.SoShaderParameter1f()
         self.shadow_opacity.name = "shadow_opacity"
         self.shadow_opacity.value = 0.0
-        self.shadow_data = None
+        self.shadow_rect = coin.SoShaderParameter4f()
+        self.shadow_rect.name = "shadow_rect"
+        self.shadow_rect.value = coin.SbVec4f(0.0, 0.0, 1.0, 1.0)
+        shadow_sampler = coin.SoShaderParameter1i()
+        shadow_sampler.name = "shadow_tex"
+        shadow_sampler.value = 0                    # texture unit 0
         self.shadow_visible = False
-        self._bounds_cache = {}
-        self._last_shadow_names = None
+        self._triangle_cache = {}       # object name -> (key, XY triangles)
+        self._shadow_key = None
+        self._has_shadow = False
+        self._poll_signature = None
         self.ground_ready = False
         params = [self.grid_color, self.base_spacing, self.grid_z,
                   self.minor_alpha, self.major_alpha,
-                  self.shadow_count, self.shadow_opacity]
-        try:
-            self.shadow_data = coin.SoShaderParameterArray1f()
-            self.shadow_data.name = "shadow_data"
-            _set_mf_floats(self.shadow_data.value,
-                           [0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE))
-            params.append(self.shadow_data)
-        except Exception as exc:
-            self.shadow_data = None
-            App.Console.PrintWarning(
-                "Grid Overlay: ground shadows unavailable (%s)\n" % exc)
+                  self.side_planes, self.axis_lines,
+                  self.shadow_opacity, self.shadow_rect, shadow_sampler]
         fragment.parameter.setValues(0, len(params), params)
+
+        # Footprint mask for the ground shadow. Linear filtering without
+        # mipmaps (textureQuality < 0.5) keeps the lookup independent of
+        # derivatives, which are undefined after the shader's discards.
+        self.shadow_tex = coin.SoTexture2()
+        self.shadow_tex.wrapS = coin.SoTexture2.CLAMP
+        self.shadow_tex.wrapT = coin.SoTexture2.CLAMP
+        self._set_shadow_image(1, 1, b"\0")
+        texture_quality = coin.SoComplexity()
+        texture_quality.textureQuality = 0.3
 
         program = coin.SoShaderProgram()
         program.shaderObject.set1Value(0, vertex)
@@ -396,6 +512,8 @@ class ShaderGrid:
         if depth is not None:
             sep.addChild(depth)
         sep.addChild(flag)
+        sep.addChild(texture_quality)
+        sep.addChild(self.shadow_tex)
         sep.addChild(program)
         sep.addChild(coords)
         sep.addChild(face)
@@ -478,10 +596,25 @@ class ShaderGrid:
         self.base_spacing.value = float(grid_spacing_mm())
         self.minor_alpha.value = strength * 0.35
         self.major_alpha.value = strength
+        self.grid_z.value = float(setting("grid_z_offset"))
+        self.side_planes.value = 1.0 if setting("side_planes") else 0.0
+        self.axis_lines.value = 1.0 if setting("axis_lines") else 0.0
 
-    SHADOW_MAX = 8           # must match SHADOW_MAX in grid.frag.glsl
-    SHADOW_STRIDE = 5        # packed centre, half extents, and corner mask
-    SHADOW_CLUSTER_GAP = 0.15
+    # Shadow mask resolution and tessellation. The tolerance is deliberately
+    # coarser than FreeCAD's display mesh so tessellate() reuses the existing
+    # triangulation instead of re-meshing the shape (seconds on big models).
+    SHADOW_TEX_MAX = 1024
+    SHADOW_TESS_REL = 0.02
+    SHADOW_SOFT_MIN = 0.004     # blur sigma as a fraction of the scene size
+    SHADOW_SOFT_RANGE = 0.05
+    SHADOW_SPREAD_RANGE = 0.3   # max outward growth, fraction of scene size
+    # Blurring with sigma = spread/2 and keeping values above this level grows
+    # a straight edge by exactly `spread` (0.5 * erfc(sqrt(2))), with rounded
+    # rather than square corners.
+    SHADOW_SPREAD_LEVEL = 0.0228
+
+    def _set_shadow_image(self, width, height, data):
+        self.shadow_tex.image.setValue(coin.SbVec2s(width, height), 1, data)
 
     @staticmethod
     def _shown(obj, depth=0):
@@ -517,252 +650,187 @@ class ShaderGrid:
                 return None
         return getattr(App, "ActiveDocument", None)
 
-    def _footprints(self):
-        """XY footprint of each visible solid-ish object.
+    def _casting_shape(self, obj):
+        """obj's Shape if it should cast a ground shadow, else None."""
+        shape = getattr(obj, "Shape", None)
+        if shape is None or shape.isNull():
+            return None
+        if obj.isDerivedFrom("Part::Datum"):    # datum planes etc.
+            return None
+        if getattr(obj, "TypeId", "") in (
+                "App::Part", "App::DocumentObjectGroup",
+                "App::DocumentObjectGroupPython", "App::LinkGroup",
+                "Assembly::AssemblyObject", "Assembly::AssemblyLink"):
+            # A container's shape covers all of its children, which already
+            # cast their own shadows.
+            return None
+        try:
+            parent = obj.getParentGeoFeatureGroup()
+        except Exception:
+            parent = None
+        if parent is not None and parent.isDerivedFrom("PartDesign::Body"):
+            # Features inside a Body hold local-coordinate shapes; the Body
+            # itself represents them in world coordinates.
+            return None
+        try:
+            if shape.countElement("Face") == 0:     # sketches and wires
+                return None
+        except Exception:
+            pass
+        if not self._shown(obj):
+            return None
+        return shape
 
-        Returns [(cx, cy, hx, hy, ground_z, name)]. Per-object bounds are cached by
-        shape hash, so unchanged objects cost almost nothing on later updates.
+    @classmethod
+    def _xy_triangles(cls, shape, placement):
+        """Shape triangles projected to world XY, as an (N, 3, 2) array.
+
+        Edge-on (vertical) triangles add nothing to the footprint and are
+        dropped, which typically removes a third of the work.
+        """
+        size = max(shape.BoundBox.DiagonalLength, 1e-6)
+        points, triangles = shape.tessellate(
+            max(size * cls.SHADOW_TESS_REL, 1e-3))
+        if not points or not triangles:
+            return None
+        pts = np.array([(v.x, v.y, v.z) for v in points], dtype=np.float64)
+        if placement is not None:
+            # tessellate() already applies the shape's own placement; swap it
+            # for the link/container-aware world placement.
+            matrix = placement.multiply(shape.Placement.inverse()).toMatrix()
+            m = np.array(matrix.A, dtype=np.float64).reshape(4, 4)
+            pts = pts @ m[:3, :3].T + m[:3, 3]
+        tris = pts[np.asarray(triangles, dtype=np.int64)][:, :, :2]
+        e1 = tris[:, 1] - tris[:, 0]
+        e2 = tris[:, 2] - tris[:, 0]
+        area = np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0])
+        keep = (area > 1e-12 * size * size) & np.isfinite(tris).all(axis=(1, 2))
+        keep &= (np.abs(tris) < 1e9).all(axis=(1, 2))
+        tris = tris[keep]
+        return tris if len(tris) else None
+
+    def _shadow_triangles(self):
+        """Footprint triangles of every shadow-casting object.
+
+        Returns (list of arrays, signature). Triangles are cached per object
+        by shape hash and world placement, so unchanged objects cost only the
+        visibility checks on later updates.
         """
         doc = self._own_doc()
         if not doc:
-            return []
-        out = []
+            return [], ()
+        parts = []
+        signature = []
         seen = set()
         for obj in getattr(doc, "Objects", []):
             try:
-                shape = getattr(obj, "Shape", None)
-                if shape is None or shape.isNull():
-                    continue
-                if obj.isDerivedFrom("Part::Datum"):    # datum planes etc.
-                    continue
-                if getattr(obj, "TypeId", "") in (
-                        "App::Part", "App::DocumentObjectGroup",
-                        "App::DocumentObjectGroupPython", "App::LinkGroup",
-                        "Assembly::AssemblyObject", "Assembly::AssemblyLink"):
-                    # A container's ViewObject bounds cover all of its
-                    # children and would create a false giant shadow.
-                    continue
-                try:
-                    parent = obj.getParentGeoFeatureGroup()
-                except Exception:
-                    parent = None
-                if parent is not None and parent.isDerivedFrom("PartDesign::Body"):
-                    # Features inside a Body hold local-coordinate shapes; the
-                    # Body itself represents them in world coordinates.
-                    continue
-                if not self._shown(obj):
+                shape = self._casting_shape(obj)
+                if shape is None:
                     continue
                 gp = _world_placement(obj)
-                key = None
                 try:
-                    key = (None if shape is None else shape.hashCode(),
+                    key = (shape.hashCode(),
                            None if gp is None else
                            (tuple(gp.Base), tuple(gp.Rotation.Q)))
                 except Exception:
-                    pass
+                    key = None
                 seen.add(obj.Name)
-                cached = self._bounds_cache.get(obj.Name)
-                if key is not None and cached and cached[0] == key:
-                    bounds = cached[1]
+                cached = self._triangle_cache.get(obj.Name)
+                if key is not None and cached is not None and cached[0] == key:
+                    tris = cached[1]
                 else:
-                    bounds = None
-                    try:
-                        has_faces = shape.countElement("Face") > 0
-                    except Exception:
-                        has_faces = True
-                    b = None
-                    if has_faces:       # skips sketches and wires
-                        if gp is not None:
-                            placed = shape.copy()
-                            placed.Placement = gp
-                            b = placed.BoundBox
-                        else:
-                            b = shape.BoundBox
-                    if b is not None:
-                        if b.isValid():
-                            vals = (b.XMin, b.YMin, b.ZMin, b.XMax, b.YMax, b.ZMax)
-                            if all(math.isfinite(v) and abs(v) < 1e9 for v in vals):
-                                bounds = vals
+                    tris = self._xy_triangles(shape, gp)
                     if key is not None:
-                        self._bounds_cache[obj.Name] = (key, bounds)
-                if bounds is None:
+                        self._triangle_cache[obj.Name] = (key, tris)
+                if tris is None:
                     continue
-                x0, y0, z0, x1, y1, z1 = bounds
-                out.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5,
-                            (x1 - x0) * 0.5, (y1 - y0) * 0.5, z0,
-                            obj.Name))
+                parts.append(tris)
+                signature.append((obj.Name, key))
             except Exception:
                 continue
-        for name in list(self._bounds_cache):      # forget deleted objects
+        for name in list(self._triangle_cache):     # forget deleted objects
             if name not in seen:
-                del self._bounds_cache[name]
-        return out
+                del self._triangle_cache[name]
+        return parts, tuple(signature)
 
-    @staticmethod
-    def _cluster_footprints(footprints):
-        """Merge nearby footprints while preserving each cluster's XY outline."""
-        parents = list(range(len(footprints)))
+    def _build_shadow_texture(self, parts, softness, spread):
+        """Rasterize, blur and upload the footprint mask. True if non-empty."""
+        if not parts:
+            self._set_shadow_image(1, 1, b"\0")
+            return False
+        tris = np.concatenate(parts)
+        flat = tris.reshape(-1, 2)
+        lo = flat.min(axis=0)
+        hi = flat.max(axis=0)
+        extent = float(max(hi[0] - lo[0], hi[1] - lo[1], 1e-6))
+        sigma = extent * (self.SHADOW_SOFT_MIN +
+                          self.SHADOW_SOFT_RANGE * softness)
+        grow = extent * self.SHADOW_SPREAD_RANGE * spread
+        pad = grow + 3.0 * sigma     # room to grow and for the fade to finish
+        lo = lo - pad
+        hi = hi + pad
+        size = hi - lo
+        limit = self.SHADOW_TEX_MAX
+        pixel = float(max(size[0], size[1])) / (limit - 2)
+        width = min(limit, _pow2_at_least(size[0] / pixel + 2))
+        height = min(limit, _pow2_at_least(size[1] / pixel + 2))
+        origin = (lo + hi) * 0.5 - np.array([width, height]) * pixel * 0.5
 
-        def find(index):
-            while parents[index] != index:
-                parents[index] = parents[parents[index]]
-                index = parents[index]
-            return index
-
-        for i, first in enumerate(footprints):
-            first_hx = max(first[2], 1e-4)
-            first_hy = max(first[3], 1e-4)
-            ax0, ay0 = first[0] - first_hx, first[1] - first_hy
-            ax1, ay1 = first[0] + first_hx, first[1] + first_hy
-            first_size = max(ax1 - ax0, ay1 - ay0)
-            for j in range(i + 1, len(footprints)):
-                second = footprints[j]
-                second_hx = max(second[2], 1e-4)
-                second_hy = max(second[3], 1e-4)
-                bx0, by0 = second[0] - second_hx, second[1] - second_hy
-                bx1, by1 = second[0] + second_hx, second[1] + second_hy
-                gap_x = max(0.0, ax0 - bx1, bx0 - ax1)
-                gap_y = max(0.0, ay0 - by1, by0 - ay1)
-                second_size = max(bx1 - bx0, by1 - by0)
-                gap_limit = (ShaderGrid.SHADOW_CLUSTER_GAP *
-                             min(first_size, second_size))
-                if math.hypot(gap_x, gap_y) <= gap_limit:
-                    first_root = find(i)
-                    second_root = find(j)
-                    if first_root != second_root:
-                        parents[second_root] = first_root
-
-        grouped = {}
-        for index, item in enumerate(footprints):
-            half_x = max(item[2], 1e-4)
-            half_y = max(item[3], 1e-4)
-            x0, y0 = item[0] - half_x, item[1] - half_y
-            x1, y1 = item[0] + half_x, item[1] + half_y
-            root = find(index)
-            if root not in grouped:
-                grouped[root] = [[(x0, y0, x1, y1)], item[4], {item[5]}]
-            else:
-                bounds, ground_z, names = grouped[root]
-                bounds.append((x0, y0, x1, y1))
-                grouped[root] = [bounds, min(ground_z, item[4]),
-                                 names | {item[5]}]
-
-        result = []
-        for bounds, ground_z, names in grouped.values():
-            x_edges = sorted({value for x0, _y0, x1, _y1 in bounds
-                              for value in (x0, x1)})
-            active = {}
-            rectangles = []
-            for x0, x1 in zip(x_edges, x_edges[1:]):
-                intervals = sorted((y0, y1) for bx0, y0, bx1, y1 in bounds
-                                   if bx0 <= x0 and bx1 >= x1)
-                merged = []
-                for y0, y1 in intervals:
-                    if merged and y0 <= merged[-1][1]:
-                        merged[-1][1] = max(merged[-1][1], y1)
-                    else:
-                        merged.append([y0, y1])
-                current = {tuple(interval) for interval in merged}
-                for interval, start_x in list(active.items()):
-                    if interval not in current:
-                        rectangles.append((start_x, x0, interval[0], interval[1]))
-                        del active[interval]
-                for interval in current:
-                    if interval not in active:
-                        active[interval] = x0
-            for interval, start_x in active.items():
-                rectangles.append((start_x, x_edges[-1],
-                                   interval[0], interval[1]))
-            for x0, x1, y0, y1 in rectangles:
-                delta = max(min(x1 - x0, y1 - y0) * 1e-6, 1e-8)
-                corner_mask = 0
-                corners = (
-                    (x0, y0, 1, 1, 1),
-                    (x1, y0, -1, 1, 2),
-                    (x0, y1, 1, -1, 4),
-                    (x1, y1, -1, -1, 8),
-                )
-                for x, y, direction_x, direction_y, bit in corners:
-                    quadrants = (
-                        (x - delta, y - delta),
-                        (x + delta, y - delta),
-                        (x - delta, y + delta),
-                        (x + delta, y + delta),
-                    )
-                    occupied = [any(bx0 < qx < bx1 and by0 < qy < by1
-                                    for bx0, by0, bx1, by1 in bounds)
-                                for qx, qy in quadrants]
-                    interior = ((1 if direction_x > 0 else 0) +
-                                (2 if direction_y > 0 else 0))
-                    if sum(occupied) == 1 and occupied[interior]:
-                        corner_mask |= bit
-                result.append(((x0 + x1) * 0.5, (y0 + y1) * 0.5,
-                               (x1 - x0) * 0.5, (y1 - y0) * 0.5,
-                               ground_z, ", ".join(sorted(names)),
-                               corner_mask))
-        return result
-
-    def _view_ground_z(self):
-        """Fallback ground elevation from FreeCAD's transformed view bounds."""
-        doc = self._own_doc()
-        if not doc:
-            return 0.0, False
-        values = []
-        for obj in getattr(doc, "Objects", []):
-            try:
-                if obj.isDerivedFrom("Part::Datum") or not self._shown(obj):
-                    continue
-                bounds = obj.ViewObject.getBoundingBox()
-                if bounds is not None and bounds.isValid():
-                    value = float(bounds.ZMin)
-                    if math.isfinite(value) and abs(value) < 1e9:
-                        values.append(value)
-            except Exception:
-                continue
-        return (min(values), bool(values)) if values else (0.0, False)
+        mask = _rasterize_triangles((tris - origin) / pixel, width, height)
+        if grow / pixel >= 1.0:
+            # Expand the footprint so objects resting on the ground still
+            # show a visible rim of shadow around their base.
+            mask = (_gaussian_blur(mask, 0.5 * grow / pixel) >
+                    self.SHADOW_SPREAD_LEVEL)
+        shade = _gaussian_blur(mask, sigma / pixel)
+        # The blur leaves 0.5 on the footprint edge; double it so the shadow
+        # is solid under the model and fades only outside of it.
+        shade = np.clip(shade * 2.0, 0.0, 1.0)
+        shade = shade * shade * (3.0 - 2.0 * shade)
+        data = (shade * 255.0 + 0.5).astype(np.uint8)
+        data[0, :] = data[-1, :] = 0      # empty border: CLAMP stays dark-free
+        data[:, 0] = data[:, -1] = 0
+        # Row 0 of an SoSFImage is the bottom row, matching increasing Y.
+        self._set_shadow_image(width, height, data.tobytes())
+        self.shadow_rect.value = coin.SbVec4f(
+            float(origin[0]), float(origin[1]),
+            1.0 / (width * pixel), 1.0 / (height * pixel))
+        App.Console.PrintLog(
+            "Grid Overlay: ground shadow from %d objects (%dx%d)\n"
+            % (len(parts), width, height))
+        return True
 
     def set_shadow_visible(self, visible):
         self.shadow_visible = bool(visible)
         self.update_shadow()
 
     def update_shadow(self):
-        """Rebuild shadow slots while keeping the grid on world Z=0."""
-        footprints = self._footprints()
-        if footprints:
-            self.ground_ready = True
-        else:
-            _view_ground_z, self.ground_ready = self._view_ground_z()
-        if self._grid_z != 0.0:
-            self._grid_z = 0.0
-            self.grid_z.value = 0.0
-
-        if self.shadow_data is None:
-            return
-        items = self._cluster_footprints(footprints) if self.shadow_visible else []
-        if not items:
+        """Rebuild the shadow mask if its inputs changed."""
+        if not self.shadow_visible or np is None:
             self.shadow_opacity.value = 0.0
-            self.shadow_count.value = 0.0
             return
-        # Keep the largest rectangle pieces if there are more than the slots.
-        items.sort(key=lambda it: it[2] * it[3], reverse=True)
-        items = items[:self.SHADOW_MAX]
-        data = []
-        for cx, cy, hx, hy, _ground_z, _name, corner_mask in items:
-            hx = max(hx, 1e-4)
-            hy = max(hy, 1e-4)
-            # Keep five values per slot so the fragment uniform remains small
-            # enough for older OpenGL implementations. Geometry height is not
-            # needed by the screen-space shadow feather.
-            data.extend((cx, cy, hx, hy, corner_mask))
-        data.extend([0.0] * (self.SHADOW_MAX * self.SHADOW_STRIDE - len(data)))
-        _set_mf_floats(self.shadow_data.value, data)
-        self.shadow_count.value = float(len(items))
-        self.shadow_opacity.value = float(setting("shadow_opacity"))
-        names = tuple(sorted({it[5] for it in items}))
-        if names != self._last_shadow_names:        # Report view "Log" level
-            self._last_shadow_names = names
-            App.Console.PrintLog(
-                "Grid Overlay: ground shadows for: %s\n" % ", ".join(names))
+        parts, signature = self._shadow_triangles()
+        self.ground_ready = bool(parts)
+        softness = setting("shadow_softness")
+        spread = setting("shadow_spread")
+        key = (signature, softness, spread)
+        if key != self._shadow_key:
+            self._shadow_key = key
+            self._has_shadow = self._build_shadow_texture(
+                parts, softness, spread)
+        self.shadow_opacity.value = (
+            float(setting("shadow_opacity")) if self._has_shadow else 0.0)
+
+    def needs_shadow_retry(self, doc):
+        """Retry an empty shadow only when the document's object list grew
+        or shrank; shape changes arrive through the document observer."""
+        if self.ground_ready or not self.shadow_visible:
+            return False
+        signature = len(getattr(doc, "Objects", ()))
+        if signature == self._poll_signature:
+            return False
+        self._poll_signature = signature
+        return True
 
     def set_visible(self, visible):
         self.visible = bool(visible)
@@ -832,11 +900,16 @@ class _AppObserver:
     def slotRecomputedDocument(self, doc):
         self._manager.schedule_shadow()
 
+    def slotChangedObject(self, obj, prop):
+        # Placement edits (e.g. the transform dragger) do not recompute, and
+        # some importers fill shapes after the recompute signal has fired.
+        if prop in ("Shape", "Placement"):
+            self._manager.schedule_shadow()
+
 
 @_publish
 class GridManager:
     def __init__(self):
-        self._grid_overlay_manager_version = MANAGER_VERSION
         self.items = {}                     # doc name -> ShaderGrid
         main = Gui.getMainWindow()
         self.shadow_timer = QtCore.QTimer(main)
@@ -891,7 +964,7 @@ class GridManager:
         belongs = grid.belongs_to(view) if grid is not None else None
         if grid is None or not belongs:
             self.ensure_grid()
-        elif not grid.ground_ready:
+        elif grid.needs_shadow_retry(doc):
             # Some Assembly/import workflows populate geometry after the
             # document activation/recompute callbacks have already fired.
             grid.update_shadow()
@@ -1001,24 +1074,17 @@ class GridManager:
         self.remove_grid()
 
 
-manager = getattr(Gui, "_GridOverlayManager", None)
-if manager is None or getattr(manager, "_grid_overlay_manager_version", None) != MANAGER_VERSION:
-    if manager is not None:
-        try:
-            Gui.removeDocumentObserver(manager)
-        except Exception:
-            pass
-        for _fn in ("shutdown", "remove_grid"):      # new / older managers
-            try:
-                getattr(manager, _fn)()
-            except Exception:
-                pass
-        try:
-            manager.timer.stop()                      # older managers polled
-        except Exception:
-            pass
-    manager = GridManager()
-    Gui._GridOverlayManager = manager
+# If the addon is loaded again in the same session (a reload while
+# developing), retire the previous manager so its observers, timers and
+# overlays do not linger next to the new ones.
+_previous = getattr(Gui, "_GridOverlayManager", None)
+if _previous is not None:
+    try:
+        _previous.shutdown()
+    except Exception:
+        pass
+manager = GridManager()
+Gui._GridOverlayManager = manager
 globals()["manager"] = manager
 
 
@@ -1027,48 +1093,112 @@ class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(SettingsDialog, self).__init__(parent or Gui.getMainWindow())
         self.setWindowTitle("Grid Overlay Settings")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(380)
         layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout(); layout.addLayout(form)
+
+        grid_box = QtWidgets.QGroupBox("Grid")
+        form = QtWidgets.QFormLayout(grid_box)
+        layout.addWidget(grid_box)
         self.enabled = QtWidgets.QCheckBox("Show custom grid")
-        self.enabled.setChecked(setting("enabled")); form.addRow(self.enabled)
-        self.shadow_enabled = QtWidgets.QCheckBox("Show ground shadow")
-        self.shadow_enabled.setChecked(setting("shadow_enabled")); form.addRow(self.shadow_enabled)
-        self.shadow_opacity = QtWidgets.QSlider(QT_HORIZONTAL)
-        self.shadow_opacity.setRange(0, 100)
-        self.shadow_opacity.setValue(int(setting("shadow_opacity") * 100))
-        form.addRow("Ground shadow opacity", self.shadow_opacity)
+        form.addRow(self.enabled)
         self.unit = QtWidgets.QComboBox()
         for key, label, _factor in GRID_UNIT_OPTIONS:
             self.unit.addItem(label, key)
-        selected_unit = setting("grid_unit")
-        for index, (key, _label, _factor) in enumerate(GRID_UNIT_OPTIONS):
-            if key == selected_unit:
-                self.unit.setCurrentIndex(index)
-                break
         form.addRow("Grid unit", self.unit)
         self.spacing = QtWidgets.QDoubleSpinBox()
         self.spacing.setRange(0.1, 100.0)
         self.spacing.setDecimals(2)
-        self.spacing.setValue(setting("base_spacing"))
-        self.unit.currentIndexChanged.connect(self._update_spacing_suffix)
-        self._update_spacing_suffix()
         form.addRow("Grid spacing", self.spacing)
-        self.opacity = QtWidgets.QSlider(QT_HORIZONTAL); self.opacity.setRange(0, 100); self.opacity.setValue(int(setting("opacity")*100))
+        self.z_offset = QtWidgets.QDoubleSpinBox()
+        self.z_offset.setRange(-1e6, 1e6)
+        self.z_offset.setDecimals(3)
+        self.z_offset.setToolTip(
+            "Elevation (world Z) of the ground grid and its shadow")
+        form.addRow("Ground height (Z)", self.z_offset)
+        self.opacity = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.opacity.setRange(0, 100)
         form.addRow("Opacity", self.opacity)
         self.color = QtWidgets.QPushButton("Choose color…")
-        self.color_value = setting("color"); self._set_color_style()
-        form.addRow("Grid color", self.color)
         self.color.clicked.connect(self.choose_color)
+        form.addRow("Grid color", self.color)
+        self.axis_lines = QtWidgets.QCheckBox("Show axis lines")
+        form.addRow(self.axis_lines)
+        self.side_planes = QtWidgets.QCheckBox(
+            "Grid in front / rear / left / right views")
+        self.side_planes.setToolTip(
+            "When the camera looks straight along X or Y, draw the grid on "
+            "the matching vertical plane behind the model")
+        form.addRow(self.side_planes)
+
+        shadow_box = QtWidgets.QGroupBox("Ground shadow")
+        shadow_form = QtWidgets.QFormLayout(shadow_box)
+        layout.addWidget(shadow_box)
+        self.shadow_enabled = QtWidgets.QCheckBox("Show ground shadow")
+        shadow_form.addRow(self.shadow_enabled)
+        self.shadow_opacity = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.shadow_opacity.setRange(0, 100)
+        shadow_form.addRow("Opacity", self.shadow_opacity)
+        self.shadow_softness = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.shadow_softness.setRange(0, 100)
+        shadow_form.addRow("Softness", self.shadow_softness)
+        self.shadow_spread = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.shadow_spread.setRange(0, 100)
+        self.shadow_spread.setToolTip(
+            "How far the shadow extends beyond the model's footprint")
+        shadow_form.addRow("Spread", self.shadow_spread)
+        if np is None:
+            shadow_box.setEnabled(False)
+            shadow_box.setToolTip("Ground shadows require numpy")
+
         buttons = QtWidgets.QDialogButtonBox(
-            _dialog_button("Apply") | _dialog_button("Cancel"))
+            _dialog_button("RestoreDefaults") | _dialog_button("Apply") |
+            _dialog_button("Cancel"))
         layout.addWidget(buttons)
         buttons.button(_dialog_button("Apply")).clicked.connect(self.apply)
+        buttons.button(_dialog_button("RestoreDefaults")).clicked.connect(
+            lambda: self._load(DEFAULTS.get))
         buttons.rejected.connect(self.reject)
 
-    def _update_spacing_suffix(self):
+        self._unit_factor = 1.0
+        self.unit.currentIndexChanged.connect(self._unit_changed)
+        self._load(setting)
+
+    def _load(self, value):
+        """Fill the widgets from setting() or from DEFAULTS.get."""
+        self.enabled.setChecked(value("enabled"))
+        self.shadow_enabled.setChecked(value("shadow_enabled"))
+        self.shadow_opacity.setValue(int(round(value("shadow_opacity") * 100)))
+        self.shadow_softness.setValue(
+            int(round(value("shadow_softness") * 100)))
+        self.shadow_spread.setValue(int(round(value("shadow_spread") * 100)))
+        self.axis_lines.setChecked(value("axis_lines"))
+        self.side_planes.setChecked(value("side_planes"))
+        self.opacity.setValue(int(round(value("opacity") * 100)))
+        self.color_value = value("color")
+        self._set_color_style()
+        self.spacing.setValue(value("base_spacing"))
+        unit = value("grid_unit")
+        index = next((i for i, option in enumerate(GRID_UNIT_OPTIONS)
+                      if option[0] == unit), 0)
+        self.unit.blockSignals(True)
+        self.unit.setCurrentIndex(index)
+        self.unit.blockSignals(False)
+        self._unit_factor = GRID_UNIT_OPTIONS[index][2]
+        self._update_suffixes()
+        self.z_offset.setValue(value("grid_z_offset") / self._unit_factor)
+
+    def _unit_changed(self):
+        # The ground height is stored in mm; keep the same physical height
+        # when the displayed unit changes.
+        height_mm = self.z_offset.value() * self._unit_factor
+        self._unit_factor = GRID_UNIT_OPTIONS[self.unit.currentIndex()][2]
+        self._update_suffixes()
+        self.z_offset.setValue(height_mm / self._unit_factor)
+
+    def _update_suffixes(self):
         key = GRID_UNIT_OPTIONS[self.unit.currentIndex()][0]
         self.spacing.setSuffix(" " + key)
+        self.z_offset.setSuffix(" " + key)
 
     def _set_color_style(self):
         self.color.setStyleSheet("background-color: %s;" % self.color_value)
@@ -1082,11 +1212,16 @@ class SettingsDialog(QtWidgets.QDialog):
         save_settings({
             "enabled": self.enabled.isChecked(),
             "shadow_enabled": self.shadow_enabled.isChecked(),
-            "shadow_opacity": self.shadow_opacity.value()/100.0,
+            "shadow_opacity": self.shadow_opacity.value() / 100.0,
+            "shadow_softness": self.shadow_softness.value() / 100.0,
+            "shadow_spread": self.shadow_spread.value() / 100.0,
             "base_spacing": self.spacing.value(),
             "grid_unit": GRID_UNIT_OPTIONS[self.unit.currentIndex()][0],
-            "opacity": self.opacity.value()/100.0,
+            "grid_z_offset": self.z_offset.value() * self._unit_factor,
+            "opacity": self.opacity.value() / 100.0,
             "color": self.color_value,
+            "axis_lines": self.axis_lines.isChecked(),
+            "side_planes": self.side_planes.isChecked(),
         })
         manager.refresh()
 
