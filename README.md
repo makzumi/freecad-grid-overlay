@@ -85,6 +85,58 @@ to open **Settings**:
 
 **Restore Defaults** resets the dialog; nothing is saved until **Apply**.
 
+### Ambient occlusion (experimental)
+
+**Ambient occlusion** (off by default) darkens creases, corners and contact
+areas between parts. It is screen-space AO, done entirely on the GPU:
+
+1. The scene is rendered a second time into a texture with a shader that
+   writes each pixel's linear depth as a 24-bit value split over the RGB
+   channels (this Coin build clamps its float texture formats).
+2. A full-screen pass rebuilds each model pixel's position and normal,
+   looks at the surface visible at nearby points, and darkens the pixel by
+   how far that surface rises above its tangent plane. Flat faces therefore
+   never shade themselves. The sampling pattern is rotated over 4×4 tiles.
+3. A 4×4 blur removes that pattern and darkens the viewport.
+
+The AO textures are rendered at half the viewport resolution; the effect is
+soft and blurred, so this is visually indistinguishable and much cheaper.
+
+**Only recomputed when the view settles.** While you orbit, pan or zoom (or
+geometry, placement or visibility changes), the effect is hidden; 150 ms
+after the last change it is computed once for the new view and fades in.
+Between changes it costs nothing: hover highlighting and other display-only
+updates do not trigger it.
+
+| Setting  | Description                                                      |
+| -------- | ---------------------------------------------------------------- |
+| Strength | How dark fully occluded areas get.                               |
+| Radius   | How far (in screen pixels) to look for occluders, 8–80 px.       |
+
+**Platform support:** on Linux X11 sessions Coin's offscreen rendering
+crashes FreeCAD, so the option is disabled there (Wayland works). Windows
+and macOS are untested. As a safeguard, if FreeCAD stops while ambient
+occlusion is being enabled, it is switched off on the next start and a
+warning is printed; ticking the box again opts back in.
+
+**Performance:** orbiting runs at the same frame rate with AO on as with
+it off, because the effect is paused while the view moves. Measured on a
+75 Hz display (75 fps is the cap):
+
+| Scene                          | Intel UHD (Raptor Lake) | RTX 4070 Laptop |
+| ------------------------------ | ----------------------- | --------------- |
+| EngineBlock example            | 75 / 75                 | 75 / 75         |
+| AssemblyExample                | 75 / 75                 | 75 / 75         |
+| 225 parts, ~0.4M triangles     | 75 / 75                 | 75 / 75         |
+| 900 parts, ~3.1M triangles     | 66 / 66                 | 57 / 57         |
+
+(AO off / AO on.) The one-off recompute after the view settles costs
+roughly one extra frame of the scene.
+
+Other limitations: the effect briefly disappears while the view moves and
+fades back in when it stops; it follows window resizes within half a second;
+and transparent objects are treated as opaque.
+
 The grid is shown automatically whenever a document is open and the overlay is
 enabled. It regenerates from the viewport's visible area as you navigate, and
 the shadow updates on geometry and placement changes (throttled to 150 ms).

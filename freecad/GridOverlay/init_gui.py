@@ -217,10 +217,15 @@ DEFAULTS = {
     "grid_z_offset": 0.0,       # millimeters, independent of the grid unit
     "side_planes": True,
     "axis_lines": True,
+    "ao_enabled": False,        # experimental ambient occlusion
+    "ao_strength": 0.6,
+    "ao_radius": 0.4,
+    "ao_crashed": False,        # set by the crash guard, cleared on re-enable
 }
-BOOL_SETTINGS = ("enabled", "shadow_enabled", "side_planes", "axis_lines")
+BOOL_SETTINGS = ("enabled", "shadow_enabled", "side_planes", "axis_lines",
+                 "ao_enabled", "ao_crashed")
 UNIT_SETTINGS = ("opacity", "shadow_opacity", "shadow_softness",
-                 "shadow_spread")
+                 "shadow_spread", "ao_strength", "ao_radius")
 _settings_cache = {}
 globals().update({
     "DEFAULTS": DEFAULTS, "BOOL_SETTINGS": BOOL_SETTINGS,
@@ -536,6 +541,18 @@ class ShaderGrid:
             # centred at the origin.
             self._disable_scene_culling()
             self.sg.addChild(self.root)
+        self.ao = None
+        if self.superimposition is not None:
+            # Ambient occlusion re-renders the scene graph into a texture, so
+            # it must live outside that graph: superimposition only.
+            try:
+                self.ao = AmbientOcclusion(
+                    self.render_manager, self.overlay_camera, coords, face)
+                self.root.addChild(self.ao.switch)
+            except Exception as exc:
+                self.ao = None
+                App.Console.PrintWarning(
+                    "Grid Overlay: ambient occlusion unavailable: %s\n" % exc)
         self.apply_settings()
 
     def _disable_scene_culling(self):
@@ -599,6 +616,8 @@ class ShaderGrid:
         self.grid_z.value = float(setting("grid_z_offset"))
         self.side_planes.value = 1.0 if setting("side_planes") else 0.0
         self.axis_lines.value = 1.0 if setting("axis_lines") else 0.0
+        if self.ao is not None:
+            self.ao.apply_settings()
 
     # Shadow mask resolution and tessellation. The tolerance is deliberately
     # coarser than FreeCAD's display mesh so tessellate() reuses the existing
@@ -864,6 +883,9 @@ class ShaderGrid:
             return False
 
     def remove(self):
+        if self.ao is not None:
+            self.ao.release()
+            self.ao = None
         if self.superimposition is not None and self.render_manager is not None:
             try:
                 self.render_manager.removeSuperimposition(self.superimposition)
@@ -888,6 +910,383 @@ class ShaderGrid:
                 self.sg.renderCulling = self._scene_render_culling
             except Exception:
                 pass
+
+
+# -- ambient occlusion safety ------------------------------------------------
+# Coin renders SoSceneTexture2 through its own offscreen GL context. On X11
+# (GLX) that path segfaults inside Coin (SoSceneTexture2P::updatePBuffer ->
+# glxglue_context_make_current), which Python cannot catch. Wayland (EGL)
+# works. Other platforms are untested, so a crash marker is written before
+# AO first renders and cleared once frames have rendered; if FreeCAD dies in
+# between, the next start disables AO instead of crashing again.
+AO_PROBE_KEY = "ao_probe_pending"
+AO_PROBE_MS = 3000
+
+
+def _ao_unsupported_reason():
+    """Why AO cannot run here, or None."""
+    try:
+        platform = str(QtGui.QGuiApplication.platformName()).lower()
+    except Exception:
+        platform = ""
+    if platform.startswith("xcb"):
+        return ("not available on X11 sessions: Coin's offscreen rendering "
+                "crashes there (works on Wayland)")
+    if setting("ao_crashed"):
+        return ("disabled after FreeCAD stopped while enabling it; "
+                "re-enable at your own risk")
+    return None
+
+
+def _ao_check_previous_crash():
+    """Run once at load: a pending probe means the last enable crashed."""
+    pending = SETTINGS.value(AO_PROBE_KEY, False)
+    if str(pending).lower() in ("true", "1"):
+        save_settings({"ao_enabled": False, "ao_crashed": True,
+                       AO_PROBE_KEY: False})
+        App.Console.PrintWarning(
+            "Grid Overlay: ambient occlusion was turned off because FreeCAD "
+            "stopped while enabling it last time.\n")
+
+
+globals().update({
+    "AO_PROBE_KEY": AO_PROBE_KEY, "AO_PROBE_MS": AO_PROBE_MS,
+    "_ao_unsupported_reason": _ao_unsupported_reason,
+    "_ao_check_previous_crash": _ao_check_previous_crash,
+})
+
+
+def _node_address(node):
+    """Stable identity of a Coin node: pivy makes a new wrapper per access."""
+    try:
+        return int(node.this)
+    except Exception:
+        return id(node)
+
+
+globals()["_node_address"] = _node_address
+
+
+@_publish
+class AmbientOcclusion:
+    """EXPERIMENTAL screen-space ambient occlusion for one 3D view.
+
+    The scene graph is rendered a second time into an SoSceneTexture2 with
+    a shader that writes packed linear depth; a full-screen shader then
+    darkens creases and contact areas. Lives in the grid's superimposition,
+    on its own switch.
+
+    Performance: that second scene pass costs about as much as a normal
+    frame, so it only runs when the view has *settled*. Camera motion (and
+    geometry, visibility or placement changes) hides the effect; SETTLE_MS
+    after the last change it renders once and fades in. Between settles
+    nothing re-renders it: the scene is mirrored under a group with
+    notifications disabled, so hover highlighting does not trigger it.
+
+    Both texture passes look through a proxy camera: a snapshot of the live
+    camera taken when the view settles, with the *screen's* aspect ratio.
+    Coin may render a scene texture at a different internal size (e.g. the
+    next power of two), and a camera that adapts to that size would no longer
+    line up with the screen. A snapshot rather than a live link also keeps
+    FreeCAD's per-frame near/far updates from re-rendering the passes.
+    """
+
+    RADIUS_MIN_PX = 8.0
+    RADIUS_RANGE_PX = 72.0
+    SETTLE_MS = 150             # quiet time before the effect is recomputed
+    FADE_MS = 40                # fade-in: FADE_STEPS frames, FADE_MS apart
+    FADE_STEPS = 5
+    _MOTION_FIELDS = ("position", "orientation", "height", "heightAngle")
+
+    def __init__(self, render_manager, camera, coords, face):
+        self.render_manager = render_manager
+        self.camera = camera
+        self._size = None
+        self._aspect = 1.0
+        self._root = render_manager.getSceneGraph()
+        if self._root is None or camera is None:
+            raise RuntimeError("view has no scene graph or camera")
+        shader_dir = os.path.join(ADDON_DIR, "Resources")
+        self._ortho = camera.isOfType(
+            coin.SoOrthographicCamera.getClassTypeId())
+        self.proxy = (coin.SoOrthographicCamera() if self._ortho
+                      else coin.SoPerspectiveCamera())
+        self.proxy.viewportMapping = coin.SoCamera.LEAVE_ALONE
+
+        # Pass 1: linear depth of the whole scene, seen through the proxy.
+        # The shader program overrides FreeCAD's fixed-function rendering for
+        # this pass only. Edge and vertex lines are hidden (empty stipple),
+        # or they would speckle the faces they outline. The mirrored content
+        # does not notify, so only an explicit refresh re-renders this pass;
+        # render caching is off so that refresh always sees current geometry.
+        no_lines = coin.SoDrawStyle()
+        no_lines.linePattern = 0
+        no_lines.setOverride(True)
+        self.scene = coin.SoSeparator()
+        self.scene.renderCaching = coin.SoSeparator.OFF
+        self.scene.addChild(no_lines)
+        self.scene.addChild(
+            self._program(shader_dir, "ao_buffer", "ao_buffer", []))
+        self.scene.addChild(self.proxy)
+        self._content = coin.SoGroup()      # the root, minus its camera
+        self._content.enableNotify(False)
+        self.scene.addChild(self._content)
+        self._root_signature = None
+        self._sync_content()
+        self.buffer = self._scene_texture()
+
+        # Pass 2: raw, dithered occlusion into a second texture.
+        texel_ao = self._param(coin.SoShaderParameter2f, "texel")
+        self.screen_height = self._param(
+            coin.SoShaderParameter1f, "screen_height", 1.0)
+        self.radius = self._param(coin.SoShaderParameter1f, "radius_px")
+        self.strength = self._param(coin.SoShaderParameter1f, "strength")
+        ao_program = self._program(shader_dir, "fullscreen", "ao", [
+            self._param(coin.SoShaderParameter1i, "gbuffer", 0),
+            texel_ao, self.screen_height, self.radius, self.strength])
+        ao_scene = coin.SoSeparator()
+        ao_scene.renderCulling = coin.SoSeparator.OFF
+        for node in (self.proxy, self.buffer, ao_program, coords, face):
+            ao_scene.addChild(node)
+        self.occlusion = self._scene_texture()
+        self.occlusion.scene.setValue(ao_scene)
+
+        # Pass 3, on screen: blur, fade and darken.
+        texel_blur = self._param(coin.SoShaderParameter2f, "texel")
+        self.fade = self._param(coin.SoShaderParameter1f, "fade", 1.0)
+        blur_program = self._program(shader_dir, "fullscreen", "ao_blur", [
+            self._param(coin.SoShaderParameter1i, "ao_tex", 0),
+            texel_blur, self.fade])
+        self._texels = (texel_ao, texel_blur)
+
+        depth_state = coin.SoDepthBuffer()
+        depth_state.set("test FALSE write FALSE")   # full-screen darkening
+        flag = coin.SoMaterial()
+        flag.transparency.setValue(0.5)             # blended pass, as the grid
+
+        sep = coin.SoSeparator()
+        sep.renderCulling = coin.SoSeparator.OFF
+        for node in (depth_state, flag, self.occlusion, blur_program,
+                     coords, face):
+            sep.addChild(node)
+        self.switch = coin.SoSwitch()
+        self.switch.addChild(sep)
+        self.switch.whichChild = -1
+        self.enabled = False
+
+        # Motion detection: field sensors on the live camera (not near/far,
+        # which FreeCAD rewrites on every frame).
+        self._sensors = []
+        for name in self._MOTION_FIELDS:
+            field = getattr(camera, name, None)
+            if field is None:
+                continue
+            sensor = coin.SoFieldSensor(self._on_motion, None)
+            sensor.attach(field)
+            self._sensors.append(sensor)
+        self._settle = QtCore.QTimer()
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(self.SETTLE_MS)
+        self._settle.timeout.connect(self._refresh)
+        self._fader = QtCore.QTimer()
+        self._fader.setInterval(self.FADE_MS)
+        self._fader.timeout.connect(self._fade_step)
+        self._fade_value = 1.0
+        self.apply_settings()
+
+    @staticmethod
+    def _scene_texture():
+        texture = coin.SoSceneTexture2()
+        texture.type = coin.SoSceneTexture2.RGBA8
+        texture.backgroundColor.setValue(coin.SbVec4f(0.0, 0.0, 0.0, 0.0))
+        texture.wrapS = coin.SoSceneTexture2.CLAMP
+        texture.wrapT = coin.SoSceneTexture2.CLAMP
+        texture.size.setValue(coin.SbVec2s(4, 4))
+        return texture
+
+    @staticmethod
+    def _param(kind, name, value=None):
+        param = kind()
+        param.name = name
+        if value is not None:
+            param.value = value
+        return param
+
+    @staticmethod
+    def _program(shader_dir, vert, frag, params):
+        vertex = coin.SoVertexShader()
+        vertex.sourceProgram.setValue(
+            os.path.join(shader_dir, vert + ".vert.glsl"))
+        fragment = coin.SoFragmentShader()
+        fragment.sourceProgram.setValue(
+            os.path.join(shader_dir, frag + ".frag.glsl"))
+        if params:
+            fragment.parameter.setValues(0, len(params), params)
+        program = coin.SoShaderProgram()
+        program.shaderObject.set1Value(0, vertex)
+        program.shaderObject.set1Value(1, fragment)
+        return program
+
+    def _snapshot_camera(self):
+        """Copy the live camera into the proxy, with the screen's aspect.
+
+        The live camera uses ADJUST_CAMERA: in a viewport taller than wide,
+        Coin enlarges the view volume by 1/aspect so `height` spans the width
+        instead. The proxy (LEAVE_ALONE) reproduces that explicitly.
+        """
+        cam, proxy, aspect = self.camera, self.proxy, self._aspect
+        for name in ("position", "orientation", "nearDistance",
+                     "farDistance", "focalDistance"):
+            getattr(proxy, name).setValue(getattr(cam, name).getValue())
+        proxy.aspectRatio = aspect
+        if self._ortho:
+            height = cam.height.getValue()
+            proxy.height = height / aspect if aspect < 1.0 else height
+        else:
+            angle = cam.heightAngle.getValue()
+            if aspect < 1.0:
+                angle = 2.0 * math.atan(math.tan(angle * 0.5) / aspect)
+            proxy.heightAngle = angle
+
+    def _sync_content(self):
+        """Mirror the render root's children except its camera, which the
+        proxy replaces. Returns True if the child list changed."""
+        children = [self._root.getChild(i)
+                    for i in range(self._root.getNumChildren())]
+        signature = tuple(_node_address(c) for c in children)
+        if signature == self._root_signature:
+            return False
+        self._root_signature = signature
+        self._content.removeAllChildren()
+        camera_type = coin.SoCamera.getClassTypeId()
+        for child in children:
+            if not child.isOfType(camera_type):
+                self._content.addChild(child)
+        return True
+
+    @staticmethod
+    def _confirm():
+        AmbientOcclusion._probe_confirmed = True
+        SETTINGS.setValue(AO_PROBE_KEY, False)
+        SETTINGS.sync()
+
+    def apply_settings(self):
+        self.radius.value = (self.RADIUS_MIN_PX +
+                             self.RADIUS_RANGE_PX * setting("ao_radius"))
+        self.strength.value = float(setting("ao_strength"))
+
+    _probe_confirmed = False     # class-wide: one successful run per session
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return
+        if enabled and not AmbientOcclusion._probe_confirmed:
+            # Written to disk *before* the first AO render; cleared once
+            # frames have rendered. See _ao_check_previous_crash.
+            SETTINGS.setValue(AO_PROBE_KEY, True)
+            SETTINGS.sync()
+            QtCore.QTimer.singleShot(AO_PROBE_MS, AmbientOcclusion._confirm)
+        self.enabled = enabled
+        if enabled:
+            self.buffer.scene.setValue(self.scene)
+            self.sync_size()
+            self._refresh()
+        else:
+            self._settle.stop()
+            self._fader.stop()
+            self.switch.whichChild = -1
+            # Detach the scene so a hidden effect costs no extra renders.
+            self.buffer.scene.setValue(None)
+            self._size = None
+
+    # -- settle / refresh ---------------------------------------------------
+    def _on_motion(self, *_args):
+        self.poke()
+
+    def poke(self):
+        """The view or geometry changed: hide until things settle again."""
+        if not self.enabled:
+            return
+        if self.switch.whichChild.getValue() != -1:
+            self.switch.whichChild = -1
+        self._fader.stop()
+        self._settle.start()            # (re)start the quiet-period timer
+
+    def _refresh(self):
+        """Render both passes once for the current view, then fade in."""
+        if not self.enabled:
+            return
+        self._snapshot_camera()
+        self.scene.touch()              # content does not notify by itself
+        self._fade_value = 0.0
+        self.fade.value = 0.0
+        self.switch.whichChild = -3
+        self._fader.start()
+
+    def _fade_step(self):
+        self._fade_value = min(1.0, self._fade_value + 1.0 / self.FADE_STEPS)
+        self.fade.value = self._fade_value
+        if self._fade_value >= 1.0:
+            self._fader.stop()
+
+    # AO is soft and blurred, so half the viewport resolution is plenty and
+    # cuts the shader work about 4x (the extra scene pass is unaffected).
+    RESOLUTION_SCALE = 0.5
+
+    @classmethod
+    def _texture_extent(cls, pixels):
+        """Power of two nearest to the scaled size, so Coin uses it as given."""
+        scaled = max(pixels * cls.RESOLUTION_SCALE, 1.0)
+        return 2 ** max(3, min(13, int(round(math.log(scaled, 2)))))
+
+    def sync_size(self):
+        """Track the viewport size and the scene root (cheap when unchanged)."""
+        if not self.enabled:
+            return
+        changed = self._sync_content()
+        try:
+            region = self.render_manager.getViewportRegion()
+            width, height = region.getViewportSizePixels().getValue()
+        except Exception:
+            return
+        size = (max(int(width), 1), max(int(height), 1))
+        if size != self._size:
+            self._size = size
+            self._aspect = float(size[0]) / size[1]
+            self.screen_height.value = float(size[1])
+            tex = (self._texture_extent(size[0]),
+                   self._texture_extent(size[1]))
+            for texture in (self.buffer, self.occlusion):
+                texture.size.setValue(coin.SbVec2s(tex[0], tex[1]))
+            for texel in self._texels:
+                texel.value = coin.SbVec2f(1.0 / tex[0], 1.0 / tex[1])
+            changed = True
+        if changed:
+            self.poke()
+
+    def release(self):
+        self.enabled = False
+        for timer in (self._settle, self._fader):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        for sensor in self._sensors:
+            try:
+                sensor.detach()
+            except Exception:
+                pass
+        self._sensors = []
+        for texture in (self.buffer, self.occlusion):
+            try:
+                texture.scene.setValue(None)
+            except Exception:
+                pass
+        try:
+            self._content.removeAllChildren()
+        except Exception:
+            pass
 
 
 @_publish
@@ -952,9 +1351,14 @@ class GridManager:
         return view if hasattr(view, "getSceneGraph") else None
 
     # -- grid lifecycle --------------------------------------------------
+    @staticmethod
+    def _overlay_wanted():
+        return setting("enabled") or (
+            setting("ao_enabled") and _ao_unsupported_reason() is None)
+
     def check_grid(self):
         """Repair an overlay removed while FreeCAD rebuilds a view graph."""
-        if not setting("enabled"):
+        if not self._overlay_wanted():
             return
         doc = getattr(App, "ActiveDocument", None)
         if doc is None:
@@ -964,7 +1368,10 @@ class GridManager:
         belongs = grid.belongs_to(view) if grid is not None else None
         if grid is None or not belongs:
             self.ensure_grid()
-        elif grid.needs_shadow_retry(doc):
+            return
+        if grid.ao is not None:
+            grid.ao.sync_size()
+        if grid.needs_shadow_retry(doc):
             # Some Assembly/import workflows populate geometry after the
             # document activation/recompute callbacks have already fired.
             grid.update_shadow()
@@ -980,7 +1387,7 @@ class GridManager:
             # replace the scene graph while keeping the document open.
             self.remove_grid(doc.Name)
             grid = None
-        if setting("enabled") and grid is None:
+        if self._overlay_wanted() and grid is None:
             if view is None:
                 if _retry < 10:     # view may not exist yet during startup
                     QtCore.QTimer.singleShot(
@@ -998,10 +1405,13 @@ class GridManager:
     def apply_settings(self):
         on = setting("enabled")
         shadow_on = on and setting("shadow_enabled")
+        ao_on = setting("ao_enabled") and _ao_unsupported_reason() is None
         for grid in self.items.values():
             grid.apply_settings()
             grid.set_visible(on)
             grid.set_shadow_visible(shadow_on)
+            if grid.ao is not None:
+                grid.ao.set_enabled(ao_on)
 
     def refresh(self):
         self.ensure_grid()
@@ -1015,6 +1425,11 @@ class GridManager:
 
     # -- ground shadow (event driven) -----------------------------------
     def schedule_shadow(self):
+        # Every caller is a geometry, placement or visibility change, which
+        # also invalidates the ambient occlusion.
+        for grid in self.items.values():
+            if grid.ao is not None:
+                grid.ao.poke()
         if not self.shadow_timer.isActive():
             self.shadow_timer.start()
 
@@ -1077,6 +1492,7 @@ class GridManager:
 # If the addon is loaded again in the same session (a reload while
 # developing), retire the previous manager so its observers, timers and
 # overlays do not linger next to the new ones.
+_ao_check_previous_crash()
 _previous = getattr(Gui, "_GridOverlayManager", None)
 if _previous is not None:
     try:
@@ -1150,6 +1566,30 @@ class SettingsDialog(QtWidgets.QDialog):
             shadow_box.setEnabled(False)
             shadow_box.setToolTip("Ground shadows require numpy")
 
+        ao_box = QtWidgets.QGroupBox("Ambient occlusion (experimental)")
+        ao_form = QtWidgets.QFormLayout(ao_box)
+        layout.addWidget(ao_box)
+        self.ao_enabled = QtWidgets.QCheckBox("Shade creases and contact areas")
+        self.ao_enabled.setToolTip(
+            "Renders the scene a second time each frame; may slow down "
+            "large models")
+        ao_form.addRow(self.ao_enabled)
+        self.ao_strength = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.ao_strength.setRange(0, 100)
+        ao_form.addRow("Strength", self.ao_strength)
+        self.ao_radius = QtWidgets.QSlider(QT_HORIZONTAL)
+        self.ao_radius.setRange(0, 100)
+        ao_form.addRow("Radius", self.ao_radius)
+        reason = _ao_unsupported_reason()
+        if reason:
+            note = QtWidgets.QLabel("Ambient occlusion is " + reason + ".")
+            note.setWordWrap(True)
+            ao_form.addRow(note)
+            if not setting("ao_crashed"):       # X11: never allow
+                for widget in (self.ao_enabled, self.ao_strength,
+                               self.ao_radius):
+                    widget.setEnabled(False)
+
         buttons = QtWidgets.QDialogButtonBox(
             _dialog_button("RestoreDefaults") | _dialog_button("Apply") |
             _dialog_button("Cancel"))
@@ -1171,6 +1611,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.shadow_softness.setValue(
             int(round(value("shadow_softness") * 100)))
         self.shadow_spread.setValue(int(round(value("shadow_spread") * 100)))
+        self.ao_enabled.setChecked(value("ao_enabled"))
+        self.ao_strength.setValue(int(round(value("ao_strength") * 100)))
+        self.ao_radius.setValue(int(round(value("ao_radius") * 100)))
         self.axis_lines.setChecked(value("axis_lines"))
         self.side_planes.setChecked(value("side_planes"))
         self.opacity.setValue(int(round(value("opacity") * 100)))
@@ -1215,6 +1658,12 @@ class SettingsDialog(QtWidgets.QDialog):
             "shadow_opacity": self.shadow_opacity.value() / 100.0,
             "shadow_softness": self.shadow_softness.value() / 100.0,
             "shadow_spread": self.shadow_spread.value() / 100.0,
+            "ao_enabled": self.ao_enabled.isChecked(),
+            # Ticking the box again after a crash is an explicit opt-in.
+            "ao_crashed": (setting("ao_crashed") and
+                           not self.ao_enabled.isChecked()),
+            "ao_strength": self.ao_strength.value() / 100.0,
+            "ao_radius": self.ao_radius.value() / 100.0,
             "base_spacing": self.spacing.value(),
             "grid_unit": GRID_UNIT_OPTIONS[self.unit.currentIndex()][0],
             "grid_z_offset": self.z_offset.value() * self._unit_factor,
